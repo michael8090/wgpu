@@ -13,7 +13,8 @@ mod framework;
 
 // number of boid particles to simulate
 
-const NUM_PARTICLES: u32 = 2000;
+const NUM_PARTICLES: u32 = 20000;
+const DELTA_T: f32 = 0.004;
 
 // number of single-particle calculations (invocations) in each gpu work group
 
@@ -50,7 +51,7 @@ impl framework::Example for Example {
         // buffer for simulation parameters uniform
 
         let sim_param_data = [
-            0.04f32, // deltaT
+            DELTA_T, // deltaT
             0.1,     // rule1Distance
             0.025,   // rule2Distance
             0.025,   // rule3Distance
@@ -143,7 +144,11 @@ impl framework::Example for Example {
             fragment: Some(wgpu::FragmentState {
                 module: &draw_shader,
                 entry_point: "main",
-                targets: &[config.format.into()],
+                targets: &[wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::default(),
+                }],
             }),
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
@@ -161,7 +166,7 @@ impl framework::Example for Example {
 
         // buffer for the three 2d triangle vertices of each instance
 
-        let vertex_buffer_data = [-0.01f32, -0.02, 0.01, -0.02, 0.00, 0.02];
+        let vertex_buffer_data = [-100f32, -200.0, 100.0, -200.0, 0.00, 200.0];
         let vertices_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
             contents: bytemuck::bytes_of(&vertex_buffer_data),
@@ -172,7 +177,7 @@ impl framework::Example for Example {
 
         let mut initial_particle_data = vec![0.0f32; (8 * NUM_PARTICLES) as usize];
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let unif = Uniform::new_inclusive(-1.0, 1.0);
+        let unif = Uniform::new_inclusive(-10000.0, 10000.0);
         for particle_instance_chunk in initial_particle_data.chunks_mut(8) {
             particle_instance_chunk[0] = unif.sample(&mut rng); // posx
             particle_instance_chunk[1] = unif.sample(&mut rng); // posy

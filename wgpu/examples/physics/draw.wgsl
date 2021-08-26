@@ -9,10 +9,10 @@ fn main(
         position.x * cos(angle) - position.y * sin(angle),
         position.x * sin(angle) + position.y * cos(angle)
     );
-    return vec4<f32>(pos + particle_pos, 0.0, 1.0);
+    return vec4<f32>(pos + particle_pos, 0.0, 10000.0);
 }
 
 [[stage(fragment)]]
 fn main() -> [[location(0)]] vec4<f32> {
-    return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    return vec4<f32>(1.0, 1.0, 1.0, 0.5);
 }
