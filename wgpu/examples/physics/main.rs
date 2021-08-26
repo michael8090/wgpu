@@ -13,7 +13,7 @@ mod framework;
 
 // number of boid particles to simulate
 
-const NUM_PARTICLES: u32 = 1500;
+const NUM_PARTICLES: u32 = 2000;
 
 // number of single-particle calculations (invocations) in each gpu work group
 
@@ -88,7 +88,7 @@ impl framework::Example for Example {
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new((NUM_PARTICLES * 16) as _),
+                            min_binding_size: wgpu::BufferSize::new((NUM_PARTICLES * 32) as _),
                         },
                         count: None,
                     },
@@ -98,7 +98,7 @@ impl framework::Example for Example {
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new((NUM_PARTICLES * 16) as _),
+                            min_binding_size: wgpu::BufferSize::new((NUM_PARTICLES * 32) as _),
                         },
                         count: None,
                     },
@@ -129,7 +129,7 @@ impl framework::Example for Example {
                 entry_point: "main",
                 buffers: &[
                     wgpu::VertexBufferLayout {
-                        array_stride: 4 * 4,
+                        array_stride: 8 * 4,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
                     },
@@ -170,14 +170,23 @@ impl framework::Example for Example {
 
         // buffer for all particles data of type [(posx,posy,velx,vely),...]
 
-        let mut initial_particle_data = vec![0.0f32; (4 * NUM_PARTICLES) as usize];
+        let mut initial_particle_data = vec![0.0f32; (8 * NUM_PARTICLES) as usize];
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let unif = Uniform::new_inclusive(-1.0, 1.0);
-        for particle_instance_chunk in initial_particle_data.chunks_mut(4) {
+        for particle_instance_chunk in initial_particle_data.chunks_mut(8) {
             particle_instance_chunk[0] = unif.sample(&mut rng); // posx
             particle_instance_chunk[1] = unif.sample(&mut rng); // posy
-            particle_instance_chunk[2] = unif.sample(&mut rng) * 0.1; // velx
-            particle_instance_chunk[3] = unif.sample(&mut rng) * 0.1; // vely
+            // particle_instance_chunk[2] = unif.sample(&mut rng) * 0.1; // velx
+            // particle_instance_chunk[3] = unif.sample(&mut rng) * 0.1; // vely
+            // particle_instance_chunk[4] = unif.sample(&mut rng) * 0.1; // ax
+            // particle_instance_chunk[5] = unif.sample(&mut rng) * 0.1; // ay
+            // particle_instance_chunk[6] = unif.sample(&mut rng) * 0.1; // m
+            particle_instance_chunk[2] = 0.0; // velx
+            particle_instance_chunk[3] = 0.0; // vely
+            particle_instance_chunk[4] = 0.0; // ax
+            particle_instance_chunk[5] = 0.0; // ay
+            particle_instance_chunk[6] = 1.0; // m
+            particle_instance_chunk[7] = unif.sample(&mut rng) * 0.1; // padding
         }
 
         // creates two buffers of particle data each of size NUM_PARTICLES
