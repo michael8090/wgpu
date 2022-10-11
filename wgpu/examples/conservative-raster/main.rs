@@ -26,8 +26,8 @@ impl Example {
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some("Low Resolution Target"),
                 size: wgpu::Extent3d {
-                    width: config.width / 16,
-                    height: config.width / 16,
+                    width: (config.width / 16).max(1),
+                    height: (config.height / 16).max(1),
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -70,7 +70,7 @@ impl framework::Example for Example {
         wgpu::Features::CONSERVATIVE_RASTERIZATION
     }
     fn optional_features() -> wgpu::Features {
-        wgpu::Features::NON_FILL_POLYGON_MODE
+        wgpu::Features::POLYGON_MODE_LINE
     }
     fn init(
         config: &wgpu::SurfaceConfiguration,
@@ -85,13 +85,12 @@ impl framework::Example for Example {
                 push_constant_ranges: &[],
             });
 
-        let shader_triangle_and_lines =
-            device.create_shader_module(&wgpu::ShaderModuleDescriptor {
-                label: None,
-                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
-                    "triangle_and_lines.wgsl"
-                ))),
-            });
+        let shader_triangle_and_lines = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+                "triangle_and_lines.wgsl"
+            ))),
+        });
 
         let pipeline_triangle_conservative =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -105,7 +104,7 @@ impl framework::Example for Example {
                 fragment: Some(wgpu::FragmentState {
                     module: &shader_triangle_and_lines,
                     entry_point: "fs_main_red",
-                    targets: &[RENDER_TARGET_FORMAT.into()],
+                    targets: &[Some(RENDER_TARGET_FORMAT.into())],
                 }),
                 primitive: wgpu::PrimitiveState {
                     conservative: true,
@@ -113,6 +112,7 @@ impl framework::Example for Example {
                 },
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
+                multiview: None,
             });
 
         let pipeline_triangle_regular =
@@ -127,16 +127,17 @@ impl framework::Example for Example {
                 fragment: Some(wgpu::FragmentState {
                     module: &shader_triangle_and_lines,
                     entry_point: "fs_main_blue",
-                    targets: &[RENDER_TARGET_FORMAT.into()],
+                    targets: &[Some(RENDER_TARGET_FORMAT.into())],
                 }),
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
+                multiview: None,
             });
 
         let pipeline_lines = if device
             .features()
-            .contains(wgpu::Features::NON_FILL_POLYGON_MODE)
+            .contains(wgpu::Features::POLYGON_MODE_LINE)
         {
             Some(
                 device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -150,7 +151,7 @@ impl framework::Example for Example {
                     fragment: Some(wgpu::FragmentState {
                         module: &shader_triangle_and_lines,
                         entry_point: "fs_main_white",
-                        targets: &[config.format.into()],
+                        targets: &[Some(config.format.into())],
                     }),
                     primitive: wgpu::PrimitiveState {
                         polygon_mode: wgpu::PolygonMode::Line,
@@ -159,6 +160,7 @@ impl framework::Example for Example {
                     },
                     depth_stencil: None,
                     multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
                 }),
             )
         } else {
@@ -183,10 +185,7 @@ impl framework::Example for Example {
                         wgpu::BindGroupLayoutEntry {
                             binding: 1,
                             visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler {
-                                filtering: false,
-                                comparison: false,
-                            },
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                             count: None,
                         },
                     ],
@@ -197,7 +196,7 @@ impl framework::Example for Example {
                 bind_group_layouts: &[&bind_group_layout],
                 push_constant_ranges: &[],
             });
-            let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: None,
                 source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("upscale.wgsl"))),
             });
@@ -213,11 +212,12 @@ impl framework::Example for Example {
                     fragment: Some(wgpu::FragmentState {
                         module: &shader,
                         entry_point: "fs_main",
-                        targets: &[config.format.into()],
+                        targets: &[Some(config.format.into())],
                     }),
                     primitive: wgpu::PrimitiveState::default(),
                     depth_stencil: None,
                     multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
                 }),
                 bind_group_layout,
             )
@@ -266,14 +266,14 @@ impl framework::Example for Example {
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("low resolution"),
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.low_res_target,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: true,
                     },
-                }],
+                })],
                 depth_stencil_attachment: None,
             });
 
@@ -285,14 +285,14 @@ impl framework::Example for Example {
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("full resolution"),
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: true,
                     },
-                }],
+                })],
                 depth_stencil_attachment: None,
             });
 

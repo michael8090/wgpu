@@ -1,10 +1,10 @@
-use std::{borrow::Cow, iter, mem, num::NonZeroU32, ops::Range, rc::Rc};
+use std::{borrow::Cow, f32::consts, iter, mem, num::NonZeroU32, ops::Range, rc::Rc};
 
 #[path = "../framework.rs"]
 mod framework;
 
 use bytemuck::{Pod, Zeroable};
-use wgpu::util::DeviceExt;
+use wgpu::util::{align_to, DeviceExt};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -80,7 +80,7 @@ fn create_plane(size: i8) -> (Vec<Vertex>, Vec<u16>) {
 }
 
 struct Entity {
-    mx_world: cgmath::Matrix4<f32>,
+    mx_world: glam::Mat4,
     rotation_speed: f32,
     color: wgpu::Color,
     vertex_buf: Rc<wgpu::Buffer>,
@@ -91,7 +91,7 @@ struct Entity {
 }
 
 struct Light {
-    pos: cgmath::Point3<f32>,
+    pos: glam::Vec3,
     color: wgpu::Color,
     fov: f32,
     depth: Range<f32>,
@@ -108,20 +108,16 @@ struct LightRaw {
 
 impl Light {
     fn to_raw(&self) -> LightRaw {
-        use cgmath::{Deg, EuclideanSpace, Matrix4, PerspectiveFov, Point3, Vector3};
-
-        let mx_view = Matrix4::look_at_rh(self.pos, Point3::origin(), Vector3::unit_z());
-        let projection = PerspectiveFov {
-            fovy: Deg(self.fov).into(),
-            aspect: 1.0,
-            near: self.depth.start,
-            far: self.depth.end,
-        };
-        let mx_correction = framework::OPENGL_TO_WGPU_MATRIX;
-        let mx_view_proj =
-            mx_correction * cgmath::Matrix4::from(projection.to_perspective()) * mx_view;
+        let view = glam::Mat4::look_at_rh(self.pos, glam::Vec3::ZERO, glam::Vec3::Z);
+        let projection = glam::Mat4::perspective_rh(
+            self.fov * consts::PI / 180.,
+            1.0,
+            self.depth.start,
+            self.depth.end,
+        );
+        let view_proj = projection * view;
         LightRaw {
-            proj: *mx_view_proj.as_ref(),
+            proj: view_proj.to_cols_array_2d(),
             pos: [self.pos.x, self.pos.y, self.pos.z, 1.0],
             color: [
                 self.color.r as f32,
@@ -175,15 +171,14 @@ impl Example {
     };
     const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-    fn generate_matrix(aspect_ratio: f32) -> cgmath::Matrix4<f32> {
-        let mx_projection = cgmath::perspective(cgmath::Deg(45f32), aspect_ratio, 1.0, 20.0);
-        let mx_view = cgmath::Matrix4::look_at_rh(
-            cgmath::Point3::new(3.0f32, -10.0, 6.0),
-            cgmath::Point3::new(0f32, 0.0, 0.0),
-            cgmath::Vector3::unit_z(),
+    fn generate_matrix(aspect_ratio: f32) -> glam::Mat4 {
+        let projection = glam::Mat4::perspective_rh(consts::FRAC_PI_4, aspect_ratio, 1.0, 20.0);
+        let view = glam::Mat4::look_at_rh(
+            glam::Vec3::new(3.0f32, -10.0, 6.0),
+            glam::Vec3::new(0f32, 0.0, 0.0),
+            glam::Vec3::Z,
         );
-        let mx_correction = framework::OPENGL_TO_WGPU_MATRIX;
-        mx_correction * mx_projection * mx_view
+        projection * view
     }
 
     fn create_depth_texture(
@@ -210,15 +205,21 @@ impl Example {
 
 impl framework::Example for Example {
     fn optional_features() -> wgpu::Features {
-        wgpu::Features::DEPTH_CLAMPING
+        wgpu::Features::DEPTH_CLIP_CONTROL
     }
 
     fn init(
-        config: &wgpu::SurfaceConfiguration,
-        _adapter: &wgpu::Adapter,
+        sc_desc: &wgpu::SurfaceConfiguration,
+        adapter: &wgpu::Adapter,
         device: &wgpu::Device,
         _queue: &wgpu::Queue,
     ) -> Self {
+        let supports_storage_resources = adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::VERTEX_STORAGE)
+            && device.limits().max_storage_buffers_per_shader_stage > 0;
+
         // Create the vertex and index buffers
         let vertex_size = mem::size_of::<Vertex>();
         let (cube_vertex_data, cube_index_data) = create_cube();
@@ -252,32 +253,32 @@ impl framework::Example for Example {
         });
 
         struct CubeDesc {
-            offset: cgmath::Vector3<f32>,
+            offset: glam::Vec3,
             angle: f32,
             scale: f32,
             rotation: f32,
         }
         let cube_descs = [
             CubeDesc {
-                offset: cgmath::vec3(-2.0, -2.0, 2.0),
+                offset: glam::Vec3::new(-2.0, -2.0, 2.0),
                 angle: 10.0,
                 scale: 0.7,
                 rotation: 0.1,
             },
             CubeDesc {
-                offset: cgmath::vec3(2.0, -2.0, 2.0),
+                offset: glam::Vec3::new(2.0, -2.0, 2.0),
                 angle: 50.0,
                 scale: 1.3,
                 rotation: 0.2,
             },
             CubeDesc {
-                offset: cgmath::vec3(-2.0, 2.0, 2.0),
+                offset: glam::Vec3::new(-2.0, 2.0, 2.0),
                 angle: 140.0,
                 scale: 1.1,
                 rotation: 0.3,
             },
             CubeDesc {
-                offset: cgmath::vec3(2.0, 2.0, 2.0),
+                offset: glam::Vec3::new(2.0, 2.0, 2.0),
                 angle: 210.0,
                 scale: 0.9,
                 rotation: 0.4,
@@ -286,11 +287,16 @@ impl framework::Example for Example {
 
         let entity_uniform_size = mem::size_of::<EntityUniforms>() as wgpu::BufferAddress;
         let num_entities = 1 + cube_descs.len() as wgpu::BufferAddress;
-        assert!(entity_uniform_size <= wgpu::BIND_BUFFER_ALIGNMENT);
-        //Note: dynamic offsets also have to be aligned to `BIND_BUFFER_ALIGNMENT`.
+        // Make the `uniform_alignment` >= `entity_uniform_size` and aligned to `min_uniform_buffer_offset_alignment`.
+        let uniform_alignment = {
+            let alignment =
+                device.limits().min_uniform_buffer_offset_alignment as wgpu::BufferAddress;
+            align_to(entity_uniform_size, alignment)
+        };
+        // Note: dynamic uniform offsets also have to be aligned to `Limits::min_uniform_buffer_offset_alignment`.
         let entity_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: num_entities * wgpu::BIND_BUFFER_ALIGNMENT,
+            size: num_entities * uniform_alignment,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -298,9 +304,8 @@ impl framework::Example for Example {
         let index_format = wgpu::IndexFormat::Uint16;
 
         let mut entities = vec![{
-            use cgmath::SquareMatrix;
             Entity {
-                mx_world: cgmath::Matrix4::identity(),
+                mx_world: glam::Mat4::IDENTITY,
                 rotation_speed: 0.0,
                 color: wgpu::Color::WHITE,
                 vertex_buf: Rc::new(plane_vertex_buf),
@@ -312,22 +317,23 @@ impl framework::Example for Example {
         }];
 
         for (i, cube) in cube_descs.iter().enumerate() {
-            use cgmath::{Decomposed, Deg, InnerSpace, Quaternion, Rotation3};
-
-            let transform = Decomposed {
-                disp: cube.offset,
-                rot: Quaternion::from_axis_angle(cube.offset.normalize(), Deg(cube.angle)),
-                scale: cube.scale,
-            };
+            let mx_world = glam::Mat4::from_scale_rotation_translation(
+                glam::Vec3::splat(cube.scale),
+                glam::Quat::from_axis_angle(
+                    cube.offset.normalize(),
+                    cube.angle * consts::PI / 180.,
+                ),
+                cube.offset,
+            );
             entities.push(Entity {
-                mx_world: cgmath::Matrix4::from(transform),
+                mx_world,
                 rotation_speed: cube.rotation,
                 color: wgpu::Color::GREEN,
                 vertex_buf: Rc::clone(&cube_vertex_buf),
                 index_buf: Rc::clone(&cube_index_buf),
                 index_format,
                 index_count: cube_index_data.len(),
-                uniform_offset: ((i + 1) * wgpu::BIND_BUFFER_ALIGNMENT as usize) as _,
+                uniform_offset: ((i + 1) * uniform_alignment as usize) as _,
             });
         }
 
@@ -398,7 +404,7 @@ impl framework::Example for Example {
             .collect::<Vec<_>>();
         let lights = vec![
             Light {
-                pos: cgmath::Point3::new(7.0, -5.0, 10.0),
+                pos: glam::Vec3::new(7.0, -5.0, 10.0),
                 color: wgpu::Color {
                     r: 0.5,
                     g: 1.0,
@@ -410,7 +416,7 @@ impl framework::Example for Example {
                 target_view: shadow_target_views[0].take().unwrap(),
             },
             Light {
-                pos: cgmath::Point3::new(-5.0, 7.0, 10.0),
+                pos: glam::Vec3::new(-5.0, 7.0, 10.0),
                 color: wgpu::Color {
                     r: 1.0,
                     g: 0.5,
@@ -427,8 +433,11 @@ impl framework::Example for Example {
         let light_storage_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: light_uniform_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
+            usage: if supports_storage_resources {
+                wgpu::BufferUsages::STORAGE
+            } else {
+                wgpu::BufferUsages::UNIFORM
+            } | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -440,7 +449,7 @@ impl framework::Example for Example {
             attributes: &vertex_attr,
         };
 
-        let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
         });
@@ -499,7 +508,9 @@ impl framework::Example for Example {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     front_face: wgpu::FrontFace::Ccw,
                     cull_mode: Some(wgpu::Face::Back),
-                    clamp_depth: device.features().contains(wgpu::Features::DEPTH_CLAMPING),
+                    unclipped_depth: device
+                        .features()
+                        .contains(wgpu::Features::DEPTH_CLIP_CONTROL),
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -514,6 +525,7 @@ impl framework::Example for Example {
                     },
                 }),
                 multisample: wgpu::MultisampleState::default(),
+                multiview: None,
             });
 
             Pass {
@@ -544,7 +556,11 @@ impl framework::Example for Example {
                             binding: 1, // lights
                             visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                ty: if supports_storage_resources {
+                                    wgpu::BufferBindingType::Storage { read_only: true }
+                                } else {
+                                    wgpu::BufferBindingType::Uniform
+                                },
                                 has_dynamic_offset: false,
                                 min_binding_size: wgpu::BufferSize::new(light_uniform_size),
                             },
@@ -563,10 +579,7 @@ impl framework::Example for Example {
                         wgpu::BindGroupLayoutEntry {
                             binding: 3,
                             visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler {
-                                comparison: true,
-                                filtering: true,
-                            },
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                             count: None,
                         },
                     ],
@@ -578,9 +591,9 @@ impl framework::Example for Example {
                 push_constant_ranges: &[],
             });
 
-            let mx_total = Self::generate_matrix(config.width as f32 / config.height as f32);
+            let mx_total = Self::generate_matrix(sc_desc.width as f32 / sc_desc.height as f32);
             let forward_uniforms = GlobalUniforms {
-                proj: *mx_total.as_ref(),
+                proj: mx_total.to_cols_array_2d(),
                 num_lights: [lights.len() as u32, 0, 0, 0],
             };
             let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -624,8 +637,12 @@ impl framework::Example for Example {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: "fs_main",
-                    targets: &[config.format.into()],
+                    entry_point: if supports_storage_resources {
+                        "fs_main"
+                    } else {
+                        "fs_main_without_storage"
+                    },
+                    targets: &[Some(sc_desc.format.into())],
                 }),
                 primitive: wgpu::PrimitiveState {
                     front_face: wgpu::FrontFace::Ccw,
@@ -640,6 +657,7 @@ impl framework::Example for Example {
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
+                multiview: None,
             });
 
             Pass {
@@ -649,7 +667,7 @@ impl framework::Example for Example {
             }
         };
 
-        let forward_depth = Self::create_depth_texture(config, device);
+        let forward_depth = Self::create_depth_texture(sc_desc, device);
 
         Example {
             entities,
@@ -696,11 +714,12 @@ impl framework::Example for Example {
         // update uniforms
         for entity in self.entities.iter_mut() {
             if entity.rotation_speed != 0.0 {
-                let rotation = cgmath::Matrix4::from_angle_x(cgmath::Deg(entity.rotation_speed));
-                entity.mx_world = entity.mx_world * rotation;
+                let rotation =
+                    glam::Mat4::from_rotation_x(entity.rotation_speed * consts::PI / 180.);
+                entity.mx_world *= rotation;
             }
             let data = EntityUniforms {
-                model: entity.mx_world.into(),
+                model: entity.mx_world.to_cols_array_2d(),
                 color: [
                     entity.color.r as f32,
                     entity.color.g as f32,
@@ -780,7 +799,7 @@ impl framework::Example for Example {
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -792,7 +811,7 @@ impl framework::Example for Example {
                         }),
                         store: true,
                     },
-                }],
+                })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.forward_depth,
                     depth_ops: Some(wgpu::Operations {
@@ -831,7 +850,10 @@ fn shadow() {
         optional_features: wgpu::Features::default(),
         base_test_parameters: framework::test_common::TestParameters::default()
             .downlevel_flags(wgpu::DownlevelFlags::COMPARISON_SAMPLERS)
-            .specific_failure(Some(wgpu::Backends::VULKAN), None, Some("V3D"), false), // rpi4 on VK doesn't work: https://gitlab.freedesktop.org/mesa/mesa/-/issues/3916
+            // rpi4 on VK doesn't work: https://gitlab.freedesktop.org/mesa/mesa/-/issues/3916
+            .specific_failure(Some(wgpu::Backends::VULKAN), None, Some("V3D"), false)
+            // llvmpipe versions in CI are flaky: https://github.com/gfx-rs/wgpu/issues/2594
+            .specific_failure(Some(wgpu::Backends::VULKAN), None, Some("llvmpipe"), true),
         tolerance: 2,
         max_outliers: 500, // bounded by rpi4
     });

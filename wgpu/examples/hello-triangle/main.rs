@@ -12,6 +12,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
+            force_fallback_adapter: false,
             // Request an adapter which can render to our surface
             compatible_surface: Some(&surface),
         })
@@ -25,7 +26,8 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 label: None,
                 features: wgpu::Features::empty(),
                 // Make sure we use the texture resolution limits from the adapter, so we can support images the size of the swapchain.
-                limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+                limits: wgpu::Limits::downlevel_webgl2_defaults()
+                    .using_resolution(adapter.limits()),
             },
             None,
         )
@@ -33,7 +35,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         .expect("Failed to create device");
 
     // Load the shaders from disk
-    let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
     });
@@ -44,7 +46,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         push_constant_ranges: &[],
     });
 
-    let swapchain_format = surface.get_preferred_format(&adapter).unwrap();
+    let swapchain_format = surface.get_supported_formats(&adapter)[0];
 
     let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: None,
@@ -57,11 +59,12 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         fragment: Some(wgpu::FragmentState {
             module: &shader,
             entry_point: "fs_main",
-            targets: &[swapchain_format.into()],
+            targets: &[Some(swapchain_format.into())],
         }),
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
+        multiview: None,
     });
 
     let mut config = wgpu::SurfaceConfiguration {
@@ -69,7 +72,8 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         format: swapchain_format,
         width: size.width,
         height: size.height,
-        present_mode: wgpu::PresentMode::Mailbox,
+        present_mode: wgpu::PresentMode::Fifo,
+        alpha_mode: surface.get_supported_alpha_modes(&adapter)[0],
     };
 
     surface.configure(&device, &config);
@@ -90,12 +94,13 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 config.width = size.width;
                 config.height = size.height;
                 surface.configure(&device, &config);
+                // On macos the window needs to be redrawn manually after resizing
+                window.request_redraw();
             }
             Event::RedrawRequested(_) => {
                 let frame = surface
-                    .get_current_frame()
-                    .expect("Failed to acquire next swap chain texture")
-                    .output;
+                    .get_current_texture()
+                    .expect("Failed to acquire next swap chain texture");
                 let view = frame
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());
@@ -104,14 +109,14 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 {
                     let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: None,
-                        color_attachments: &[wgpu::RenderPassColorAttachment {
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: &view,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::GREEN),
                                 store: true,
                             },
-                        }],
+                        })],
                         depth_stencil_attachment: None,
                     });
                     rpass.set_pipeline(&render_pipeline);
@@ -119,6 +124,7 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
                 }
 
                 queue.submit(Some(encoder.finish()));
+                frame.present();
             }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,

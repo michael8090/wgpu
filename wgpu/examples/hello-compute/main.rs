@@ -33,7 +33,7 @@ async fn run() {
 
 async fn execute_gpu(numbers: &[u32]) -> Option<Vec<u32>> {
     // Instantiates instance of WebGPU
-    let instance = wgpu::Instance::new(wgpu::Backends::PRIMARY);
+    let instance = wgpu::Instance::new(wgpu::Backends::all());
 
     // `request_adapter` instantiates the general connection to the GPU
     let adapter = instance
@@ -69,7 +69,7 @@ async fn execute_gpu_inner(
     numbers: &[u32],
 ) -> Option<Vec<u32>> {
     // Loads the shader from WGSL
-    let cs_module = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+    let cs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
     });
@@ -136,7 +136,7 @@ async fn execute_gpu_inner(
         cpass.set_pipeline(&compute_pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
         cpass.insert_debug_marker("compute collatz iterations");
-        cpass.dispatch(numbers.len() as u32, 1, 1); // Number of cells to run, the (x,y,z) size of item being processed
+        cpass.dispatch_workgroups(numbers.len() as u32, 1, 1); // Number of cells to run, the (x,y,z) size of item being processed
     }
     // Sets adds copy operation to command encoder.
     // Will copy data from storage buffer on GPU to staging buffer on CPU.
@@ -147,8 +147,9 @@ async fn execute_gpu_inner(
 
     // Note that we're not calling `.await` here.
     let buffer_slice = staging_buffer.slice(..);
-    // Gets the future representing when `staging_buffer` can be read from
-    let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
+    // Sets the buffer up for mapping, sending over the result of the mapping back to us when it is finished.
+    let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
 
     // Poll the device in a blocking manner so that our future resolves.
     // In an actual application, `device.poll(...)` should
@@ -156,7 +157,7 @@ async fn execute_gpu_inner(
     device.poll(wgpu::Maintain::Wait);
 
     // Awaits until `buffer_future` can be read from
-    if let Ok(()) = buffer_future.await {
+    if let Some(Ok(())) = receiver.receive().await {
         // Gets contents of buffer
         let data = buffer_slice.get_mapped_range();
         // Since contents are got in bytes, this converts these bytes back to u32

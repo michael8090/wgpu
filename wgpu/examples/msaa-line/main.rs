@@ -60,7 +60,7 @@ impl Example {
             fragment: Some(wgpu::FragmentState {
                 module: shader,
                 entry_point: "fs_main",
-                targets: &[config.format.into()],
+                targets: &[Some(config.format.into())],
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::LineList,
@@ -72,13 +72,15 @@ impl Example {
                 count: sample_count,
                 ..Default::default()
             },
+            multiview: None,
         });
         let mut encoder =
             device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
                 label: None,
-                color_formats: &[config.format],
+                color_formats: &[Some(config.format)],
                 depth_stencil: None,
                 sample_count,
+                multiview: None,
             });
         encoder.set_pipeline(&pipeline);
         encoder.set_vertex_buffer(0, vertex_buffer.slice(..));
@@ -124,7 +126,7 @@ impl framework::Example for Example {
         log::info!("Press left/right arrow keys to change sample_count.");
         let sample_count = 4;
 
-        let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
         });
@@ -248,28 +250,32 @@ impl framework::Example for Example {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
-            let ops = wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                store: true,
-            };
             let rpass_color_attachment = if self.sample_count == 1 {
                 wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
-                    ops,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: true,
+                    },
                 }
             } else {
                 wgpu::RenderPassColorAttachment {
                     view: &self.multisampled_framebuffer,
                     resolve_target: Some(view),
-                    ops,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        // Storing pre-resolve MSAA data is unnecessary if it isn't used later.
+                        // On tile-based GPU, avoid store can reduce your app's memory footprint.
+                        store: false,
+                    },
                 }
             };
 
             encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: None,
-                    color_attachments: &[rpass_color_attachment],
+                    color_attachments: &[Some(rpass_color_attachment)],
                     depth_stencil_attachment: None,
                 })
                 .execute_bundles(iter::once(&self.bundle));

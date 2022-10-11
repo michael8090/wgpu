@@ -1,4 +1,6 @@
+use parking_lot::Mutex;
 use std::{
+    num::NonZeroU32,
     ptr,
     sync::{atomic, Arc},
     thread, time,
@@ -42,7 +44,7 @@ fn create_depth_stencil_desc(state: &wgt::DepthStencilState) -> mtl::DepthStenci
         let front_desc = create_stencil_desc(&s.front, s.read_mask, s.write_mask);
         desc.set_front_face_stencil(Some(&front_desc));
         let back_desc = create_stencil_desc(&s.back, s.read_mask, s.write_mask);
-        desc.set_front_face_stencil(Some(&back_desc));
+        desc.set_back_face_stencil(Some(&back_desc));
     }
     desc
 }
@@ -72,8 +74,19 @@ impl super::Device {
         )
         .map_err(|e| crate::PipelineError::Linkage(stage_bit, format!("MSL: {:?}", e)))?;
 
+        log::debug!(
+            "Naga generated shader for entry point '{}' and stage {:?}\n{}",
+            stage.entry_point,
+            naga_stage,
+            &source
+        );
+
         let options = mtl::CompileOptions::new();
         options.set_language_version(self.shared.private_caps.msl_version);
+
+        if self.shared.private_caps.supports_preserve_invariance {
+            options.set_preserve_invariance(true);
+        }
 
         let library = self
             .shared
@@ -111,43 +124,46 @@ impl super::Device {
         let mut sized_bindings = Vec::new();
         let mut immutable_buffer_mask = 0;
         for (var_handle, var) in module.global_variables.iter() {
-            if var.class == naga::StorageClass::WorkGroup {
-                let size = module.types[var.ty].inner.span(&module.constants);
-                wg_memory_sizes.push(size);
-            }
-
-            if let naga::TypeInner::Struct { ref members, .. } = module.types[var.ty].inner {
-                let br = match var.binding {
-                    Some(ref br) => br.clone(),
-                    None => continue,
-                };
-
-                if !ep_info[var_handle].is_empty() {
-                    let storage_access_store = match var.class {
-                        naga::StorageClass::Storage { access } => {
+            match var.space {
+                naga::AddressSpace::WorkGroup => {
+                    if !ep_info[var_handle].is_empty() {
+                        let size = module.types[var.ty].inner.size(&module.constants);
+                        wg_memory_sizes.push(size);
+                    }
+                }
+                naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. } => {
+                    let br = match var.binding {
+                        Some(ref br) => br.clone(),
+                        None => continue,
+                    };
+                    let storage_access_store = match var.space {
+                        naga::AddressSpace::Storage { access } => {
                             access.contains(naga::StorageAccess::STORE)
                         }
                         _ => false,
                     };
+
                     // check for an immutable buffer
-                    if !storage_access_store {
+                    if !ep_info[var_handle].is_empty() && !storage_access_store {
                         let psm = &layout.naga_options.per_stage_map[naga_stage];
                         let slot = psm.resources[&br].buffer.unwrap();
                         immutable_buffer_mask |= 1 << slot;
                     }
-                }
 
-                // check for the unsized buffer
-                if let Some(member) = members.last() {
+                    let mut dynamic_array_container_ty = var.ty;
+                    if let naga::TypeInner::Struct { ref members, .. } = module.types[var.ty].inner
+                    {
+                        dynamic_array_container_ty = members.last().unwrap().ty;
+                    }
                     if let naga::TypeInner::Array {
                         size: naga::ArraySize::Dynamic,
                         ..
-                    } = module.types[member.ty].inner
+                    } = module.types[dynamic_array_container_ty].inner
                     {
-                        // Note: unwraps are fine, since the MSL is already generated
                         sized_bindings.push(br);
                     }
                 }
+                _ => {}
             }
         }
 
@@ -173,6 +189,28 @@ impl super::Device {
                 .unwrap()
                 .set_mutability(mtl::MTLMutability::Immutable);
         }
+    }
+
+    pub unsafe fn texture_from_raw(
+        raw: mtl::Texture,
+        raw_format: mtl::MTLPixelFormat,
+        raw_type: mtl::MTLTextureType,
+        array_layers: u32,
+        mip_levels: u32,
+        copy_size: crate::CopyExtent,
+    ) -> super::Texture {
+        super::Texture {
+            raw,
+            raw_format,
+            raw_type,
+            array_layers,
+            mip_levels,
+            copy_size,
+        }
+    }
+
+    pub fn raw_device(&self) -> &Mutex<mtl::Device> {
+        &self.shared.device
     }
 }
 
@@ -204,7 +242,6 @@ impl crate::Device<super::Api> for super::Device {
         Ok(super::Buffer {
             raw,
             size: desc.size,
-            options,
         })
     }
     unsafe fn destroy_buffer(&self, _buffer: super::Buffer) {}
@@ -236,6 +273,11 @@ impl crate::Device<super::Api> for super::Device {
 
         let descriptor = mtl::TextureDescriptor::new();
         let mut array_layers = desc.size.depth_or_array_layers;
+        let mut copy_size = crate::CopyExtent {
+            width: desc.size.width,
+            height: desc.size.height,
+            depth: 1,
+        };
         let mtl_type = match desc.dimension {
             wgt::TextureDimension::D1 => {
                 if desc.size.depth_or_array_layers > 1 {
@@ -259,6 +301,7 @@ impl crate::Device<super::Api> for super::Device {
             wgt::TextureDimension::D3 => {
                 descriptor.set_depth(desc.size.depth_or_array_layers as u64);
                 array_layers = 1;
+                copy_size.depth = desc.size.depth_or_array_layers;
                 mtl::MTLTextureType::D3
             }
         };
@@ -282,6 +325,7 @@ impl crate::Device<super::Api> for super::Device {
             raw_type: mtl_type,
             mip_levels: desc.mip_level_count,
             array_layers,
+            copy_size,
         })
     }
 
@@ -300,6 +344,8 @@ impl crate::Device<super::Api> for super::Device {
             conv::map_texture_view_dimension(desc.dimension)
         };
 
+        //Note: this doesn't check properly if the mipmap level count or array layer count
+        // is explicitly set to 1.
         let raw = if raw_format == texture.raw_format
             && raw_type == texture.raw_type
             && desc.range == wgt::ImageSubresourceRange::default()
@@ -330,7 +376,9 @@ impl crate::Device<super::Api> for super::Device {
                 },
             );
             if let Some(label) = desc.label {
-                raw.set_label(label);
+                objc::rc::autoreleasepool(|| {
+                    raw.set_label(label);
+                });
             }
             raw
         };
@@ -357,14 +405,14 @@ impl crate::Device<super::Api> for super::Device {
             wgt::FilterMode::Linear => mtl::MTLSamplerMipFilter::Linear,
         });
 
-        if let Some(aniso) = desc.anisotropy_clamp {
-            descriptor.set_max_anisotropy(aniso.get() as _);
-        }
-
         let [s, t, r] = desc.address_modes;
         descriptor.set_address_mode_s(conv::map_address_mode(s));
         descriptor.set_address_mode_t(conv::map_address_mode(t));
         descriptor.set_address_mode_r(conv::map_address_mode(r));
+
+        if let Some(aniso) = desc.anisotropy_clamp {
+            descriptor.set_max_anisotropy(aniso.get() as _);
+        }
 
         if let Some(ref range) = desc.lod_clamp {
             descriptor.set_lod_min_clamp(range.start);
@@ -378,8 +426,23 @@ impl crate::Device<super::Api> for super::Device {
         if let Some(fun) = desc.compare {
             descriptor.set_compare_function(conv::map_compare_function(fun));
         }
+
         if let Some(border_color) = desc.border_color {
-            descriptor.set_border_color(conv::map_border_color(border_color));
+            if let wgt::SamplerBorderColor::Zero = border_color {
+                if s == wgt::AddressMode::ClampToBorder {
+                    descriptor.set_address_mode_s(mtl::MTLSamplerAddressMode::ClampToZero);
+                }
+
+                if t == wgt::AddressMode::ClampToBorder {
+                    descriptor.set_address_mode_t(mtl::MTLSamplerAddressMode::ClampToZero);
+                }
+
+                if r == wgt::AddressMode::ClampToBorder {
+                    descriptor.set_address_mode_r(mtl::MTLSamplerAddressMode::ClampToZero);
+                }
+            } else {
+                descriptor.set_border_color(conv::map_border_color(border_color));
+            }
         }
 
         if let Some(label) = desc.label {
@@ -442,6 +505,7 @@ impl crate::Device<super::Api> for super::Device {
         let mut bind_group_infos = arrayvec::ArrayVec::new();
 
         // First, place the push constants
+        let mut total_push_constants = 0;
         for info in stage_data.iter_mut() {
             for pcr in desc.push_constant_ranges {
                 if pcr.stages.contains(map_naga_stage(info.stage)) {
@@ -463,6 +527,8 @@ impl crate::Device<super::Api> for super::Device {
                 info.pc_buffer = Some(info.counters.buffers);
                 info.counters.buffers += 1;
             }
+
+            total_push_constants = total_push_constants.max(info.pc_limit);
         }
 
         // Second, place the described resources
@@ -502,10 +568,12 @@ impl crate::Device<super::Api> for super::Device {
                     }
 
                     let mut target = naga::back::msl::BindTarget::default();
+                    let count = entry.count.map_or(1, NonZeroU32::get);
+                    target.binding_array_size = entry.count.map(NonZeroU32::get);
                     match entry.ty {
                         wgt::BindingType::Buffer { ty, .. } => {
                             target.buffer = Some(info.counters.buffers as _);
-                            info.counters.buffers += 1;
+                            info.counters.buffers += count;
                             if let wgt::BufferBindingType::Storage { read_only } = ty {
                                 target.mutable = !read_only;
                             }
@@ -514,15 +582,15 @@ impl crate::Device<super::Api> for super::Device {
                             target.sampler = Some(naga::back::msl::BindSamplerTarget::Resource(
                                 info.counters.samplers as _,
                             ));
-                            info.counters.samplers += 1;
+                            info.counters.samplers += count;
                         }
                         wgt::BindingType::Texture { .. } => {
                             target.texture = Some(info.counters.textures as _);
-                            info.counters.textures += 1;
+                            info.counters.textures += count;
                         }
                         wgt::BindingType::StorageTexture { access, .. } => {
                             target.texture = Some(info.counters.textures as _);
-                            info.counters.textures += 1;
+                            info.counters.textures += count;
                             target.mutable = match access {
                                 wgt::StorageTextureAccess::ReadOnly => false,
                                 wgt::StorageTextureAccess::WriteOnly => true,
@@ -588,6 +656,7 @@ impl crate::Device<super::Api> for super::Device {
                     mtl::MTLLanguageVersion::V2_1 => (2, 1),
                     mtl::MTLLanguageVersion::V2_2 => (2, 2),
                     mtl::MTLLanguageVersion::V2_3 => (2, 3),
+                    mtl::MTLLanguageVersion::V2_4 => (2, 4),
                 },
                 inline_samplers: Default::default(),
                 spirv_cross_compatibility: false,
@@ -606,7 +675,15 @@ impl crate::Device<super::Api> for super::Device {
                         ..per_stage_map.cs
                     },
                 },
+                bounds_check_policies: naga::proc::BoundsCheckPolicies {
+                    index: naga::proc::BoundsCheckPolicy::ReadZeroSkipWrite,
+                    buffer: naga::proc::BoundsCheckPolicy::ReadZeroSkipWrite,
+                    image: naga::proc::BoundsCheckPolicy::ReadZeroSkipWrite,
+                    // TODO: support bounds checks on binding arrays
+                    binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
+                },
             },
+            total_push_constants,
         })
     }
     unsafe fn destroy_pipeline_layout(&self, _pipeline_layout: super::PipelineLayout) {}
@@ -626,7 +703,7 @@ impl crate::Device<super::Api> for super::Device {
                     ..
                 } = layout.ty
                 {
-                    dynamic_offsets_count += 1;
+                    dynamic_offsets_count += size;
                 }
                 if !layout.visibility.contains(stage_bit) {
                     continue;
@@ -637,39 +714,44 @@ impl crate::Device<super::Api> for super::Device {
                         has_dynamic_offset,
                         ..
                     } => {
-                        debug_assert_eq!(size, 1);
-                        let source = &desc.buffers[entry.resource_index as usize];
-                        let remaining_size =
-                            wgt::BufferSize::new(source.buffer.size - source.offset);
-                        let binding_size = match ty {
-                            wgt::BufferBindingType::Storage { .. } => {
-                                source.size.or(remaining_size)
-                            }
-                            _ => None,
-                        };
-                        bg.buffers.push(super::BufferResource {
-                            ptr: source.buffer.as_raw(),
-                            offset: source.offset,
-                            dynamic_index: if has_dynamic_offset {
-                                Some(dynamic_offsets_count - 1)
-                            } else {
-                                None
-                            },
-                            binding_size,
-                            binding_location: layout.binding,
-                        });
+                        let start = entry.resource_index as usize;
+                        let end = start + size as usize;
+                        bg.buffers
+                            .extend(desc.buffers[start..end].iter().map(|source| {
+                                let remaining_size =
+                                    wgt::BufferSize::new(source.buffer.size - source.offset);
+                                let binding_size = match ty {
+                                    wgt::BufferBindingType::Storage { .. } => {
+                                        source.size.or(remaining_size)
+                                    }
+                                    _ => None,
+                                };
+                                super::BufferResource {
+                                    ptr: source.buffer.as_raw(),
+                                    offset: source.offset,
+                                    dynamic_index: if has_dynamic_offset {
+                                        Some(dynamic_offsets_count - 1)
+                                    } else {
+                                        None
+                                    },
+                                    binding_size,
+                                    binding_location: layout.binding,
+                                }
+                            }));
                         counter.buffers += 1;
                     }
                     wgt::BindingType::Sampler { .. } => {
-                        let res = desc.samplers[entry.resource_index as usize].as_raw();
-                        bg.samplers.push(res);
-                        counter.samplers += 1;
+                        let start = entry.resource_index as usize;
+                        let end = start + size as usize;
+                        bg.samplers
+                            .extend(desc.samplers[start..end].iter().map(|samp| samp.as_raw()));
+                        counter.samplers += size;
                     }
                     wgt::BindingType::Texture { .. } | wgt::BindingType::StorageTexture { .. } => {
-                        let start = entry.resource_index;
-                        let end = start + size;
+                        let start = entry.resource_index as usize;
+                        let end = start + size as usize;
                         bg.textures.extend(
-                            desc.textures[start as usize..end as usize]
+                            desc.textures[start..end]
                                 .iter()
                                 .map(|tex| tex.view.as_raw()),
                         );
@@ -703,6 +785,16 @@ impl crate::Device<super::Api> for super::Device {
         desc: &crate::RenderPipelineDescriptor<super::Api>,
     ) -> Result<super::RenderPipeline, crate::PipelineError> {
         let descriptor = mtl::RenderPipelineDescriptor::new();
+
+        let raw_triangle_fill_mode = match desc.primitive.polygon_mode {
+            wgt::PolygonMode::Fill => mtl::MTLTriangleFillMode::Fill,
+            wgt::PolygonMode::Line => mtl::MTLTriangleFillMode::Lines,
+            wgt::PolygonMode::Point => panic!(
+                "{:?} is not enabled for this backend",
+                wgt::Features::POLYGON_MODE_POINT
+            ),
+        };
+
         let (primitive_class, raw_primitive_type) =
             conv::map_primitive_topology(desc.primitive.topology);
 
@@ -751,6 +843,12 @@ impl crate::Device<super::Api> for super::Device {
 
         for (i, ct) in desc.color_targets.iter().enumerate() {
             let at_descriptor = descriptor.color_attachments().object_at(i as u64).unwrap();
+            let ct = if let Some(color_target) = ct.as_ref() {
+                color_target
+            } else {
+                at_descriptor.set_pixel_format(mtl::MTLPixelFormat::Invalid);
+                continue;
+            };
 
             let raw_format = self.shared.private_caps.map_format(ct.format);
             at_descriptor.set_pixel_format(raw_format);
@@ -794,7 +892,7 @@ impl crate::Device<super::Api> for super::Device {
         };
 
         if desc.layout.total_counters.vs.buffers + (desc.vertex_buffers.len() as u32)
-            > self.shared.private_caps.max_buffers_per_stage
+            > self.shared.private_caps.max_vertex_buffers
         {
             let msg = format!(
                 "pipeline needs too many buffers in the vertex stage: {} vertex and {} layout",
@@ -811,7 +909,7 @@ impl crate::Device<super::Api> for super::Device {
             let vertex_descriptor = mtl::VertexDescriptor::new();
             for (i, vb) in desc.vertex_buffers.iter().enumerate() {
                 let buffer_index =
-                    self.shared.private_caps.max_buffers_per_stage as u64 - 1 - i as u64;
+                    self.shared.private_caps.max_vertex_buffers as u64 - 1 - i as u64;
                 let buffer_desc = vertex_descriptor.layouts().object_at(buffer_index).unwrap();
 
                 buffer_desc.set_stride(vb.array_stride);
@@ -868,10 +966,11 @@ impl crate::Device<super::Api> for super::Device {
                 sized_bindings: fs_sized_bindings,
             },
             raw_primitive_type,
+            raw_triangle_fill_mode,
             raw_front_winding: conv::map_winding(desc.primitive.front_face),
             raw_cull_mode: conv::map_cull_mode(desc.primitive.cull_mode),
-            raw_depth_clip_mode: if self.features.contains(wgt::Features::DEPTH_CLAMPING) {
-                Some(if desc.primitive.clamp_depth {
+            raw_depth_clip_mode: if self.features.contains(wgt::Features::DEPTH_CLIP_CONTROL) {
+                Some(if desc.primitive.unclipped_depth {
                     mtl::MTLDepthClipMode::Clamp
                 } else {
                     mtl::MTLDepthClipMode::Clip

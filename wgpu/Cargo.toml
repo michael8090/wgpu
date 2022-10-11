@@ -1,11 +1,11 @@
 [package]
 name = "wgpu"
-version = "0.10.1"
+version = "0.14.0"
 authors = ["wgpu developers"]
-edition = "2018"
+edition = "2021"
 description = "Rusty WebGPU API wrapper"
 homepage = "https://wgpu.rs/"
-repository = "https://github.com/gfx-rs/wgpu/tree/v0.10"
+repository = "https://github.com/gfx-rs/wgpu/tree/v0.13"
 keywords = ["graphics"]
 license = "MIT OR Apache-2.0"
 exclude = [
@@ -23,6 +23,7 @@ autotests = false
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 
@@ -30,125 +31,137 @@ all-features = true
 name = "wgpu-tests"
 path = "tests/root.rs"
 
+[[example]]
+name = "boids"
+test = true
+
+[[example]]
+name = "bunnymark"
+test = true
+
+[[example]]
+name = "conservative-raster"
+test = true
+
+[[example]]
+name = "cube"
+test = true
+
+[[example]]
+name = "hello-compute"
+test = true
+
+[[example]]
+name = "mipmap"
+test = true
+
+[[example]]
+name = "msaa-line"
+test = true
+
+[[example]]
+name = "shadow"
+test = true
+
+[[example]]
+name = "skybox"
+test = true
+
+[[example]]
+name = "texture-arrays"
+test = true
+
+[[example]]
+name = "water"
+test = true
+
 [features]
-default = []
+default = ["wgsl"]
 spirv = ["naga/spv-in"]
-spirv-web = ["spirv", "naga/wgsl-out"]
+glsl = ["naga/glsl-in"]
+wgsl = ["wgc?/wgsl"]
 trace = ["serde", "wgc/trace"]
 replay = ["serde", "wgc/replay"]
+angle = ["wgc/angle"]
 webgl = ["wgc"]
+emscripten = ["webgl"]
+vulkan-portability = ["wgc/vulkan-portability"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.wgc]
 package = "wgpu-core"
 path = "../wgpu-core"
-version = "0.10"
+version = "0.14"
 features = ["raw-window-handle"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.wgc]
 package = "wgpu-core"
 path = "../wgpu-core"
-version = "0.10"
+version = "0.14"
 features = ["raw-window-handle"]
 optional = true
 
 [dependencies.wgt]
 package = "wgpu-types"
 path = "../wgpu-types"
-version = "0.10"
+version = "0.14"
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.hal]
+[target.'cfg(any(not(target_arch = "wasm32"), target_os = "emscripten"))'.dependencies.hal]
 package = "wgpu-hal"
 path = "../wgpu-hal"
-version = "0.10"
+version = "0.14"
 
 [dependencies]
 arrayvec = "0.7"
 log = "0.4"
-parking_lot = "0.11"
-raw-window-handle = "0.3"
+# parking_lot 0.12 switches from `winapi` to `windows`; permit either
+parking_lot = ">=0.11,<0.13"
+raw-window-handle = "0.5"
 serde = { version = "1", features = ["derive"], optional = true }
 smallvec = "1"
+static_assertions = "1.1.0"
 
 [dev-dependencies]
 bitflags = "1"
 bytemuck = { version = "1.4", features = ["derive"] }
-cgmath = "0.18"
-ddsfile = "0.4"
+glam = "0.21.3"
+ddsfile = "0.5"
+futures-intrusive = "0.4"
 log = "0.4"
 # Opt out of noise's "default-features" to avoid "image" feature as a dependency count optimization.
 # This will not be required in the next release since it has been removed from the default feature in https://github.com/Razaekel/noise-rs/commit/1af9e1522236b2c584fb9a02150c9c67a5e6bb04#diff-2e9d962a08321605940b5a657135052fbcef87b5e360662bb527c96d9a615542
 noise = { version = "0.7", default-features = false }
 obj = "0.10"
-png = "0.16"
-rand = { version = "0.7.2", features = ["wasm-bindgen"] }
-winit = { version = "0.25", features = ["web-sys"] }
+png = "0.17"
+nanorand = { version = "0.7", default-features = false, features = ["wyrand"] }
+winit = "0.27.1"                                                                # for "halmark" example
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 async-executor = "1.0"
 pollster = "0.2"
-env_logger = "0.8"
+env_logger = "0.9"
 
 [dependencies.naga]
 git = "https://github.com/gfx-rs/naga"
-rev = "93db57c"
-#version = "0.6"
+rev = "c52d9102"
+version = "0.10"
+features = ["clone"]
 optional = true
 
 # used to test all the example shaders
 [dev-dependencies.naga]
 git = "https://github.com/gfx-rs/naga"
-rev = "93db57c"
-#version = "0.6"
+rev = "c52d9102"
+version = "0.10"
 features = ["wgsl-in"]
 
-[[example]]
-name="boids"
-test = true
-
-[[example]]
-name="bunnymark"
-test = true
-
-[[example]]
-name="conservative-raster"
-test = true
-
-[[example]]
-name="cube"
-test = true
-
-[[example]]
-name="hello-compute"
-test = true
-
-[[example]]
-name="mipmap"
-test = true
-
-[[example]]
-name="msaa-line"
-test = true
-
-[[example]]
-name="shadow"
-test = true
-
-[[example]]
-name="skybox"
-test = true
-
-[[example]]
-name="texture-arrays"
-required-features = ["spirv"]
-test = true
-
-[[example]]
-name="water"
-test = true
+[target.'cfg(target_arch = "wasm32")'.dependencies.naga]
+git = "https://github.com/gfx-rs/naga"
+rev = "c52d9102"
+version = "0.10"
+features = ["wgsl-out"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = "0.2.76" # remember to change version in wiki as well
-web-sys = { version = "0.3.53", features = [
+web-sys = { version = "0.3.60", features = [
     "Document",
     "Navigator",
     "Node",
@@ -156,6 +169,7 @@ web-sys = { version = "0.3.53", features = [
     "Gpu",
     "GpuAdapter",
     "GpuAddressMode",
+    "GpuAutoLayoutMode",
     "GpuBindGroup",
     "GpuBindGroupDescriptor",
     "GpuBindGroupEntry",
@@ -171,12 +185,11 @@ web-sys = { version = "0.3.53", features = [
     "GpuBufferBindingLayout",
     "GpuBufferBindingType",
     "GpuBufferDescriptor",
-    "GpuBufferUsage",
+    "GpuCanvasAlphaMode",
     "GpuCanvasContext",
     "GpuCanvasConfiguration",
     "GpuColorDict",
     "GpuColorTargetState",
-    "GpuColorWrite",
     "GpuCommandBuffer",
     "GpuCommandBufferDescriptor",
     "GpuCommandEncoder",
@@ -195,6 +208,7 @@ web-sys = { version = "0.3.53", features = [
     "GpuDeviceDescriptor",
     "GpuDeviceLostInfo",
     "GpuDeviceLostReason",
+    "GpuError",
     "GpuErrorFilter",
     "GpuExtent3dDict",
     "GpuFeatureName",
@@ -202,11 +216,14 @@ web-sys = { version = "0.3.53", features = [
     "GpuFragmentState",
     "GpuFrontFace",
     "GpuImageCopyBuffer",
+    "GpuImageCopyExternalImage",
     "GpuImageCopyTexture",
+    "GpuImageCopyTextureTagged",
     "GpuImageDataLayout",
     "GpuIndexFormat",
     "GpuLoadOp",
-    "GpuMapMode",
+    "gpu_map_mode",
+    "GpuMipmapFilterMode",
     "GpuMultisampleState",
     "GpuObjectDescriptorBase",
     "GpuOrigin2dDict",
@@ -215,7 +232,6 @@ web-sys = { version = "0.3.53", features = [
     "GpuPipelineDescriptorBase",
     "GpuPipelineLayout",
     "GpuPipelineLayoutDescriptor",
-    "GpuPipelineStatisticName",
     "GpuPowerPreference",
     "GpuPrimitiveState",
     "GpuPrimitiveTopology",
@@ -241,7 +257,6 @@ web-sys = { version = "0.3.53", features = [
     "GpuSamplerDescriptor",
     "GpuShaderModule",
     "GpuShaderModuleDescriptor",
-    "GpuShaderStage",
     "GpuStencilFaceState",
     "GpuStencilOperation",
     "GpuStorageTextureAccess",
@@ -256,7 +271,6 @@ web-sys = { version = "0.3.53", features = [
     "GpuTextureDimension",
     "GpuTextureFormat",
     "GpuTextureSampleType",
-    "GpuTextureUsage",
     "GpuTextureView",
     "GpuTextureViewDescriptor",
     "GpuTextureViewDimension",
@@ -269,11 +283,28 @@ web-sys = { version = "0.3.53", features = [
     "GpuVertexState",
     "GpuVertexStepMode",
     "HtmlCanvasElement",
+    "OffscreenCanvas",
+    "ImageBitmap",
+    "ImageBitmapRenderingContext",
     "Window",
-]}
-js-sys = "0.3.50"
-wasm-bindgen-futures = "0.4.23"
+    "WorkerGlobalScope",
+    "WorkerNavigator"
+] }
+wasm-bindgen = "0.2.83"
+js-sys = "0.3.60"
+wasm-bindgen-futures = "0.4.33"
+# parking_lot 0.12 switches from `winapi` to `windows`; permit either
+parking_lot = ">=0.11,<0.13"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-console_error_panic_hook = "0.1.6"
-console_log = "0.1.2"
+console_error_panic_hook = "0.1.7"
+console_log = "0.2"
+# We need these features in the framework examples
+web-sys = { version = "0.3.60", features = [
+    "Location",
+    "Blob",
+    "RequestInit",
+    "RequestMode",
+    "Request",
+    "Response"
+] }

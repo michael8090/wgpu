@@ -28,7 +28,7 @@ impl<I: Clone + Debug + wgc::id::TypedId> wgc::hub::IdentityHandlerFactory<I>
     for IdentityPassThroughFactory
 {
     type Filter = IdentityPassThrough<I>;
-    fn spawn(&self, _min_index: u32) -> Self::Filter {
+    fn spawn(&self) -> Self::Filter {
         IdentityPassThrough(PhantomData)
     }
 }
@@ -80,11 +80,11 @@ impl GlobalPlay for wgc::hub::Global<IdentityPassThroughFactory> {
                 trace::Command::ClearBuffer { dst, offset, size } => self
                     .command_encoder_clear_buffer::<A>(encoder, dst, offset, size)
                     .unwrap(),
-                trace::Command::ClearImage {
+                trace::Command::ClearTexture {
                     dst,
                     subresource_range,
                 } => self
-                    .command_encoder_clear_image::<A>(encoder, dst, &subresource_range)
+                    .command_encoder_clear_texture::<A>(encoder, dst, &subresource_range)
                     .unwrap(),
                 trace::Command::WriteTimestamp {
                     query_set_id,
@@ -107,6 +107,15 @@ impl GlobalPlay for wgc::hub::Global<IdentityPassThroughFactory> {
                         destination,
                         destination_offset,
                     )
+                    .unwrap(),
+                trace::Command::PushDebugGroup(marker) => self
+                    .command_encoder_push_debug_group::<A>(encoder, &marker)
+                    .unwrap(),
+                trace::Command::PopDebugGroup => {
+                    self.command_encoder_pop_debug_group::<A>(encoder).unwrap()
+                }
+                trace::Command::InsertDebugMarker(marker) => self
+                    .command_encoder_insert_debug_marker::<A>(encoder, &marker)
                     .unwrap(),
                 trace::Command::RunComputePass { base } => {
                     self.command_encoder_run_compute_pass_impl::<A>(encoder, base.as_ref())
@@ -149,7 +158,9 @@ impl GlobalPlay for wgc::hub::Global<IdentityPassThroughFactory> {
             Action::Init { .. } => {
                 panic!("Unexpected Action::Init: has to be the first action only")
             }
-            Action::ConfigureSurface { .. } | Action::Present(_) => {
+            Action::ConfigureSurface { .. }
+            | Action::Present(_)
+            | Action::DiscardSurfaceTexture(_) => {
                 panic!("Unexpected Surface action: winit feature is not enabled")
             }
             Action::CreateBuffer(id, desc) => {

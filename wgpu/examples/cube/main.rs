@@ -2,7 +2,7 @@
 mod framework;
 
 use bytemuck::{Pod, Zeroable};
-use std::{borrow::Cow, mem};
+use std::{borrow::Cow, f32::consts, future::Future, mem, pin::Pin, task};
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -83,6 +83,28 @@ fn create_texels(size: usize) -> Vec<u8> {
         .collect()
 }
 
+/// A wrapper for `pop_error_scope` futures that panics if an error occurs.
+///
+/// Given a future `inner` of an `Option<E>` for some error type `E`,
+/// wait for the future to be ready, and panic if its value is `Some`.
+///
+/// This can be done simpler with `FutureExt`, but we don't want to add
+/// a dependency just for this small case.
+struct ErrorFuture<F> {
+    inner: F,
+}
+impl<F: Future<Output = Option<wgpu::Error>>> Future for ErrorFuture<F> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<()> {
+        let inner = unsafe { self.map_unchecked_mut(|me| &mut me.inner) };
+        inner.poll(cx).map(|error| {
+            if let Some(e) = error {
+                panic!("Rendering {}", e);
+            }
+        })
+    }
+}
+
 struct Example {
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
@@ -94,21 +116,20 @@ struct Example {
 }
 
 impl Example {
-    fn generate_matrix(aspect_ratio: f32) -> cgmath::Matrix4<f32> {
-        let mx_projection = cgmath::perspective(cgmath::Deg(45f32), aspect_ratio, 1.0, 10.0);
-        let mx_view = cgmath::Matrix4::look_at_rh(
-            cgmath::Point3::new(1.5f32, -5.0, 3.0),
-            cgmath::Point3::new(0f32, 0.0, 0.0),
-            cgmath::Vector3::unit_z(),
+    fn generate_matrix(aspect_ratio: f32) -> glam::Mat4 {
+        let projection = glam::Mat4::perspective_rh(consts::FRAC_PI_4, aspect_ratio, 1.0, 10.0);
+        let view = glam::Mat4::look_at_rh(
+            glam::Vec3::new(1.5f32, -5.0, 3.0),
+            glam::Vec3::ZERO,
+            glam::Vec3::Z,
         );
-        let mx_correction = framework::OPENGL_TO_WGPU_MATRIX;
-        mx_correction * mx_projection * mx_view
+        projection * view
     }
 }
 
 impl framework::Example for Example {
     fn optional_features() -> wgt::Features {
-        wgt::Features::NON_FILL_POLYGON_MODE
+        wgt::Features::POLYGON_MODE_LINE
     }
 
     fn init(
@@ -219,7 +240,7 @@ impl framework::Example for Example {
             label: None,
         });
 
-        let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
         });
@@ -252,7 +273,7 @@ impl framework::Example for Example {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: "fs_main",
-                targets: &[config.format.into()],
+                targets: &[Some(config.format.into())],
             }),
             primitive: wgpu::PrimitiveState {
                 cull_mode: Some(wgpu::Face::Back),
@@ -260,12 +281,10 @@ impl framework::Example for Example {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
+            multiview: None,
         });
 
-        let pipeline_wire = if device
-            .features()
-            .contains(wgt::Features::NON_FILL_POLYGON_MODE)
-        {
+        let pipeline_wire = if device.features().contains(wgt::Features::POLYGON_MODE_LINE) {
             let pipeline_wire = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: None,
                 layout: Some(&pipeline_layout),
@@ -277,7 +296,7 @@ impl framework::Example for Example {
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
                     entry_point: "fs_wire",
-                    targets: &[wgpu::ColorTargetState {
+                    targets: &[Some(wgpu::ColorTargetState {
                         format: config.format,
                         blend: Some(wgpu::BlendState {
                             color: wgpu::BlendComponent {
@@ -288,7 +307,7 @@ impl framework::Example for Example {
                             alpha: wgpu::BlendComponent::REPLACE,
                         }),
                         write_mask: wgpu::ColorWrites::ALL,
-                    }],
+                    })],
                 }),
                 primitive: wgpu::PrimitiveState {
                     front_face: wgpu::FrontFace::Ccw,
@@ -298,6 +317,7 @@ impl framework::Example for Example {
                 },
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
+                multiview: None,
             });
             Some(pipeline_wire)
         } else {
@@ -336,14 +356,15 @@ impl framework::Example for Example {
         view: &wgpu::TextureView,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _spawner: &framework::Spawner,
+        spawner: &framework::Spawner,
     ) {
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -355,7 +376,7 @@ impl framework::Example for Example {
                         }),
                         store: true,
                     },
-                }],
+                })],
                 depth_stencil_attachment: None,
             });
             rpass.push_debug_group("Prepare data for draw.");
@@ -373,6 +394,11 @@ impl framework::Example for Example {
         }
 
         queue.submit(Some(encoder.finish()));
+
+        // If an error occurs, report it and panic.
+        spawner.spawn_local(ErrorFuture {
+            inner: device.pop_error_scope(),
+        });
     }
 }
 
@@ -399,7 +425,7 @@ fn cube_lines() {
         image_path: "/examples/cube/screenshot-lines.png",
         width: 1024,
         height: 768,
-        optional_features: wgpu::Features::NON_FILL_POLYGON_MODE,
+        optional_features: wgpu::Features::POLYGON_MODE_LINE,
         base_test_parameters: framework::test_common::TestParameters::default(),
         tolerance: 2,
         max_outliers: 600, // Bounded by rpi4 on GL

@@ -4,7 +4,7 @@ version = "0.1.0"
 authors = [
 	"Dzmitry Malyshau <kvark@mozilla.com>",
 ]
-edition = "2018"
+edition = "2021"
 description = "WebGPU trace player"
 homepage = "https://github.com/gfx-rs/wgpu"
 repository = "https://github.com/gfx-rs/wgpu"
@@ -15,11 +15,11 @@ publish = false
 [features]
 
 [dependencies]
-env_logger = "0.8"
+env_logger = "0.9"
 log = "0.4"
-raw-window-handle = "0.3"
-ron = "0.6"
-winit = { version = "0.25", optional = true }
+raw-window-handle = "0.5"
+ron = "0.8"
+winit = { version = "0.27", optional = true }
 
 [dependencies.wgt]
 path = "../wgpu-types"
@@ -29,7 +29,7 @@ features = ["replay"]
 [dependencies.wgc]
 path = "../wgpu-core"
 package = "wgpu-core"
-features = ["replay", "raw-window-handle"]
+features = ["replay", "raw-window-handle", "strict_asserts", "wgsl"]
 
 [dev-dependencies]
 serde = "1"

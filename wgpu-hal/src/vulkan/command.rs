@@ -2,7 +2,6 @@ use super::conv;
 
 use arrayvec::ArrayVec;
 use ash::{extensions::ext, vk};
-use inplace_it::inplace_or_alloc_from_iter;
 
 use std::{mem, ops::Range, slice};
 
@@ -16,7 +15,9 @@ impl super::Texture {
     {
         let aspects = self.aspects;
         let fi = self.format_info;
+        let copy_size = self.copy_size;
         regions.map(move |r| {
+            let extent = r.texture_base.max_copy_size(&copy_size).min(&r.size);
             let (image_subresource, image_offset) =
                 conv::map_subresource_layers(&r.texture_base, aspects);
             vk::BufferImageCopy {
@@ -30,7 +31,7 @@ impl super::Texture {
                     .map_or(0, |rpi| rpi.get() * fi.block_dimensions.1 as u32),
                 image_subresource,
                 image_offset,
-                image_extent: conv::map_copy_extent(&r.size),
+                image_extent: conv::map_copy_extent(&extent),
             }
         })
     }
@@ -61,6 +62,9 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
             raw,
             label.unwrap_or_default(),
         );
+
+        // Reset this in case the last renderpass was never ended.
+        self.rpass_debug_marker_active = false;
 
         let vk_info = vk::CommandBufferBeginInfo::builder()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
@@ -94,7 +98,7 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         let _ = self
             .device
             .raw
-            .reset_command_pool(self.raw, vk::CommandPoolResetFlags::RELEASE_RESOURCES);
+            .reset_command_pool(self.raw, vk::CommandPoolResetFlags::default());
     }
 
     unsafe fn transition_buffers<'a, T>(&mut self, barriers: T)
@@ -179,13 +183,13 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         }
     }
 
-    unsafe fn fill_buffer(&mut self, buffer: &super::Buffer, range: crate::MemoryRange, value: u8) {
+    unsafe fn clear_buffer(&mut self, buffer: &super::Buffer, range: crate::MemoryRange) {
         self.device.raw.cmd_fill_buffer(
             self.active,
             buffer.raw,
             range.start,
             range.end - range.start,
-            (value as u32) * 0x01010101,
+            0,
         );
     }
 
@@ -203,11 +207,12 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
             size: r.size.get(),
         });
 
-        inplace_or_alloc_from_iter(vk_regions_iter, |vk_regions| {
-            self.device
-                .raw
-                .cmd_copy_buffer(self.active, src.raw, dst.raw, vk_regions)
-        })
+        self.device.raw.cmd_copy_buffer(
+            self.active,
+            src.raw,
+            dst.raw,
+            &smallvec::SmallVec::<[vk::BufferCopy; 32]>::from_iter(vk_regions_iter),
+        );
     }
 
     unsafe fn copy_texture_to_texture<T>(
@@ -226,25 +231,27 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
                 conv::map_subresource_layers(&r.src_base, src.aspects);
             let (dst_subresource, dst_offset) =
                 conv::map_subresource_layers(&r.dst_base, dst.aspects);
+            let extent = r
+                .size
+                .min(&r.src_base.max_copy_size(&src.copy_size))
+                .min(&r.dst_base.max_copy_size(&dst.copy_size));
             vk::ImageCopy {
                 src_subresource,
                 src_offset,
                 dst_subresource,
                 dst_offset,
-                extent: conv::map_copy_extent(&r.size),
+                extent: conv::map_copy_extent(&extent),
             }
         });
 
-        inplace_or_alloc_from_iter(vk_regions_iter, |vk_regions| {
-            self.device.raw.cmd_copy_image(
-                self.active,
-                src.raw,
-                src_layout,
-                dst.raw,
-                DST_IMAGE_LAYOUT,
-                vk_regions,
-            );
-        });
+        self.device.raw.cmd_copy_image(
+            self.active,
+            src.raw,
+            src_layout,
+            dst.raw,
+            DST_IMAGE_LAYOUT,
+            &smallvec::SmallVec::<[vk::ImageCopy; 32]>::from_iter(vk_regions_iter),
+        );
     }
 
     unsafe fn copy_buffer_to_texture<T>(
@@ -257,15 +264,13 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
     {
         let vk_regions_iter = dst.map_buffer_copies(regions);
 
-        inplace_or_alloc_from_iter(vk_regions_iter, |vk_regions| {
-            self.device.raw.cmd_copy_buffer_to_image(
-                self.active,
-                src.raw,
-                dst.raw,
-                DST_IMAGE_LAYOUT,
-                vk_regions,
-            );
-        });
+        self.device.raw.cmd_copy_buffer_to_image(
+            self.active,
+            src.raw,
+            dst.raw,
+            DST_IMAGE_LAYOUT,
+            &smallvec::SmallVec::<[vk::BufferImageCopy; 32]>::from_iter(vk_regions_iter),
+        );
     }
 
     unsafe fn copy_texture_to_buffer<T>(
@@ -280,15 +285,13 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         let src_layout = conv::derive_image_layout(src_usage, src.aspects);
         let vk_regions_iter = src.map_buffer_copies(regions);
 
-        inplace_or_alloc_from_iter(vk_regions_iter, |vk_regions| {
-            self.device.raw.cmd_copy_image_to_buffer(
-                self.active,
-                src.raw,
-                src_layout,
-                dst.raw,
-                vk_regions,
-            );
-        });
+        self.device.raw.cmd_copy_image_to_buffer(
+            self.active,
+            src.raw,
+            src_layout,
+            dst.raw,
+            &smallvec::SmallVec::<[vk::BufferImageCopy; 32]>::from_iter(vk_regions_iter),
+        );
     }
 
     unsafe fn begin_query(&mut self, set: &super::QuerySet, index: u32) {
@@ -353,22 +356,36 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         let caps = &self.device.private_caps;
 
         for cat in desc.color_attachments {
-            vk_clear_values.push(vk::ClearValue {
-                color: cat.make_vk_clear_color(),
-            });
-            vk_image_views.push(cat.target.view.raw);
-            rp_key.colors.push(super::ColorAttachmentKey {
-                base: cat.target.make_attachment_key(cat.ops, caps),
-                resolve: cat
-                    .resolve_target
-                    .as_ref()
-                    .map(|target| target.make_attachment_key(crate::AttachmentOps::STORE, caps)),
-            });
-            fb_key.attachments.push(cat.target.view.attachment.clone());
-            if let Some(ref at) = cat.resolve_target {
-                vk_clear_values.push(mem::zeroed());
-                vk_image_views.push(at.view.raw);
-                fb_key.attachments.push(at.view.attachment.clone());
+            if let Some(cat) = cat.as_ref() {
+                vk_clear_values.push(vk::ClearValue {
+                    color: cat.make_vk_clear_color(),
+                });
+                vk_image_views.push(cat.target.view.raw);
+                let color = super::ColorAttachmentKey {
+                    base: cat.target.make_attachment_key(cat.ops, caps),
+                    resolve: cat.resolve_target.as_ref().map(|target| {
+                        target.make_attachment_key(crate::AttachmentOps::STORE, caps)
+                    }),
+                };
+
+                rp_key.colors.push(Some(color));
+                fb_key.attachments.push(cat.target.view.attachment.clone());
+                if let Some(ref at) = cat.resolve_target {
+                    vk_clear_values.push(mem::zeroed());
+                    vk_image_views.push(at.view.raw);
+                    fb_key.attachments.push(at.view.attachment.clone());
+                }
+
+                // Assert this attachment is valid for the detected multiview, as a sanity check
+                // The driver crash for this is really bad on AMD, so the check is worth it
+                if let Some(multiview) = desc.multiview {
+                    assert_eq!(cat.target.view.layers, multiview);
+                    if let Some(ref resolve_target) = cat.resolve_target {
+                        assert_eq!(resolve_target.view.layers, multiview);
+                    }
+                }
+            } else {
+                rp_key.colors.push(None);
             }
         }
         if let Some(ref ds) = desc.depth_stencil_attachment {
@@ -384,8 +401,15 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
                 stencil_ops: ds.stencil_ops,
             });
             fb_key.attachments.push(ds.target.view.attachment.clone());
+
+            // Assert this attachment is valid for the detected multiview, as a sanity check
+            // The driver crash for this is really bad on AMD, so the check is worth it
+            if let Some(multiview) = desc.multiview {
+                assert_eq!(ds.target.view.layers, multiview);
+            }
         }
         rp_key.sample_count = fb_key.sample_count;
+        rp_key.multiview = desc.multiview;
 
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
@@ -406,25 +430,34 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
             min_depth: 0.0,
             max_depth: 1.0,
         }];
-        let vk_scissors = [render_area];
 
         let raw_pass = self.device.make_render_pass(rp_key).unwrap();
-
         let raw_framebuffer = self
             .device
             .make_framebuffer(fb_key, raw_pass, desc.label)
             .unwrap();
 
-        let mut vk_attachment_info = vk::RenderPassAttachmentBeginInfo::builder()
-            .attachments(&vk_image_views)
-            .build();
         let mut vk_info = vk::RenderPassBeginInfo::builder()
             .render_pass(raw_pass)
             .render_area(render_area)
             .clear_values(&vk_clear_values)
             .framebuffer(raw_framebuffer);
-        if caps.imageless_framebuffers {
-            vk_info = vk_info.push_next(&mut vk_attachment_info);
+        let mut vk_attachment_info = if caps.imageless_framebuffers {
+            Some(
+                vk::RenderPassAttachmentBeginInfo::builder()
+                    .attachments(&vk_image_views)
+                    .build(),
+            )
+        } else {
+            None
+        };
+        if let Some(attachment_info) = vk_attachment_info.as_mut() {
+            vk_info = vk_info.push_next(attachment_info);
+        }
+
+        if let Some(label) = desc.label {
+            self.begin_debug_marker(label);
+            self.rpass_debug_marker_active = true;
         }
 
         self.device
@@ -432,7 +465,7 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
             .cmd_set_viewport(self.active, 0, &vk_viewports);
         self.device
             .raw
-            .cmd_set_scissor(self.active, 0, &vk_scissors);
+            .cmd_set_scissor(self.active, 0, &[render_area]);
         self.device
             .raw
             .cmd_begin_render_pass(self.active, &vk_info, vk::SubpassContents::INLINE);
@@ -441,6 +474,10 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
     }
     unsafe fn end_render_pass(&mut self) {
         self.device.raw.cmd_end_render_pass(self.active);
+        if self.rpass_debug_marker_active {
+            self.end_debug_marker();
+            self.rpass_debug_marker_active = false;
+        }
     }
 
     unsafe fn set_bind_group(
@@ -560,9 +597,11 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
             .cmd_set_scissor(self.active, 0, &vk_scissors);
     }
     unsafe fn set_stencil_reference(&mut self, value: u32) {
-        self.device
-            .raw
-            .cmd_set_stencil_reference(self.active, vk::StencilFaceFlags::all(), value);
+        self.device.raw.cmd_set_stencil_reference(
+            self.active,
+            vk::StencilFaceFlags::FRONT_AND_BACK,
+            value,
+        );
     }
     unsafe fn set_blend_constants(&mut self, color: &[f32; 4]) {
         self.device.raw.cmd_set_blend_constants(self.active, color);
@@ -638,19 +677,8 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
     ) {
         let stride = mem::size_of::<wgt::DrawIndirectArgs>() as u32;
         match self.device.extension_fns.draw_indirect_count {
-            Some(super::ExtensionFn::Extension(ref t)) => {
+            Some(ref t) => {
                 t.cmd_draw_indirect_count(
-                    self.active,
-                    buffer.raw,
-                    offset,
-                    count_buffer.raw,
-                    count_offset,
-                    max_count,
-                    stride,
-                );
-            }
-            Some(super::ExtensionFn::Promoted) => {
-                self.device.raw.cmd_draw_indirect_count(
                     self.active,
                     buffer.raw,
                     offset,
@@ -673,19 +701,8 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
     ) {
         let stride = mem::size_of::<wgt::DrawIndexedIndirectArgs>() as u32;
         match self.device.extension_fns.draw_indirect_count {
-            Some(super::ExtensionFn::Extension(ref t)) => {
+            Some(ref t) => {
                 t.cmd_draw_indexed_indirect_count(
-                    self.active,
-                    buffer.raw,
-                    offset,
-                    count_buffer.raw,
-                    count_offset,
-                    max_count,
-                    stride,
-                );
-            }
-            Some(super::ExtensionFn::Promoted) => {
-                self.device.raw.cmd_draw_indexed_indirect_count(
                     self.active,
                     buffer.raw,
                     offset,
@@ -703,10 +720,16 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
 
     unsafe fn begin_compute_pass(&mut self, desc: &crate::ComputePassDescriptor) {
         self.bind_point = vk::PipelineBindPoint::COMPUTE;
-        self.begin_debug_marker(desc.label.unwrap_or_default());
+        if let Some(label) = desc.label {
+            self.begin_debug_marker(label);
+            self.rpass_debug_marker_active = true;
+        }
     }
     unsafe fn end_compute_pass(&mut self) {
-        self.end_debug_marker();
+        if self.rpass_debug_marker_active {
+            self.end_debug_marker();
+            self.rpass_debug_marker_active = false
+        }
     }
 
     unsafe fn set_compute_pipeline(&mut self, pipeline: &super::ComputePipeline) {

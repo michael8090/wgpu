@@ -19,7 +19,10 @@ fn read_png(path: impl AsRef<Path>, width: u32, height: u32) -> Option<Vec<u8>> 
         }
     };
     let decoder = png::Decoder::new(Cursor::new(data));
-    let (info, mut reader) = decoder.read_info().ok()?;
+    let mut reader = decoder.read_info().ok()?;
+
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buffer).ok()?;
     if info.width != width {
         log::warn!("image comparison invalid: size mismatch");
         return None;
@@ -28,7 +31,7 @@ fn read_png(path: impl AsRef<Path>, width: u32, height: u32) -> Option<Vec<u8>> 
         log::warn!("image comparison invalid: size mismatch");
         return None;
     }
-    if info.color_type != png::ColorType::RGBA {
+    if info.color_type != png::ColorType::Rgba {
         log::warn!("image comparison invalid: color type mismatch");
         return None;
     }
@@ -36,9 +39,6 @@ fn read_png(path: impl AsRef<Path>, width: u32, height: u32) -> Option<Vec<u8>> 
         log::warn!("image comparison invalid: bit depth mismatch");
         return None;
     }
-
-    let mut buffer = vec![0; info.buffer_size()];
-    reader.next_frame(&mut buffer).ok()?;
 
     Some(buffer)
 }
@@ -53,7 +53,7 @@ fn write_png(
     let file = BufWriter::new(File::create(path).unwrap());
 
     let mut encoder = png::Encoder::new(file, width, height);
-    encoder.set_color(png::ColorType::RGBA);
+    encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_compression(compression);
     let mut writer = encoder.write_header().unwrap();
@@ -62,7 +62,7 @@ fn write_png(
 }
 
 fn calc_difference(lhs: u8, rhs: u8) -> u8 {
-    (lhs as i16 - rhs as i16).abs() as u8
+    (lhs as i16 - rhs as i16).unsigned_abs() as u8
 }
 
 pub fn compare_image_output(
@@ -107,7 +107,7 @@ pub fn compare_image_output(
             .unwrap();
 
         if outliers > max_outliers {
-            // Because the deta is mismatched, lets output the difference to a file.
+            // Because the data is mismatched, lets output the difference to a file.
             let old_path = Path::new(&path);
             let actual_path = Path::new(&path).with_file_name(
                 OsString::from_str(

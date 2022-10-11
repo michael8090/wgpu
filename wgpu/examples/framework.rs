@@ -1,6 +1,10 @@
 use std::future::Future;
+#[cfg(target_arch = "wasm32")]
+use std::str::FromStr;
 #[cfg(not(target_arch = "wasm32"))]
-use std::time::{Duration, Instant};
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_sys::{ImageBitmapRenderingContext, OffscreenCanvas};
 use winit::{
     event::{self, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
@@ -9,15 +13,6 @@ use winit::{
 #[cfg(test)]
 #[path = "../tests/common/mod.rs"]
 pub mod test_common;
-
-#[rustfmt::skip]
-#[allow(unused)]
-pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
-    1.0, 0.0, 0.0, 0.0,
-    0.0, 1.0, 0.0, 0.0,
-    0.0, 0.0, 0.5, 0.0,
-    0.0, 0.0, 0.5, 1.0,
-);
 
 #[allow(dead_code)]
 pub fn cast_slice<T>(data: &[T]) -> &[u8] {
@@ -40,8 +35,15 @@ pub trait Example: 'static + Sized {
     fn required_features() -> wgpu::Features {
         wgpu::Features::empty()
     }
+    fn required_downlevel_capabilities() -> wgpu::DownlevelCapabilities {
+        wgpu::DownlevelCapabilities {
+            flags: wgpu::DownlevelFlags::empty(),
+            shader_model: wgpu::ShaderModel::Sm5,
+            ..wgpu::DownlevelCapabilities::default()
+        }
+    }
     fn required_limits() -> wgpu::Limits {
-        wgpu::Limits::downlevel_defaults() // These downlevel limits will allow the code to run on all possible hardware
+        wgpu::Limits::downlevel_webgl2_defaults() // These downlevel limits will allow the code to run on all possible hardware
     }
     fn init(
         config: &wgpu::SurfaceConfiguration,
@@ -74,6 +76,14 @@ struct Setup {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    #[cfg(target_arch = "wasm32")]
+    offscreen_canvas_setup: Option<OffscreenCanvasSetup>,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct OffscreenCanvasSetup {
+    offscreen_canvas: OffscreenCanvas,
+    bitmap_renderer: ImageBitmapRenderingContext,
 }
 
 async fn setup<E: Example>(title: &str) -> Setup {
@@ -95,7 +105,11 @@ async fn setup<E: Example>(title: &str) -> Setup {
     #[cfg(target_arch = "wasm32")]
     {
         use winit::platform::web::WindowExtWebSys;
-        console_log::init().expect("could not initialize logger");
+        let query_string = web_sys::window().unwrap().location().search().unwrap();
+        let level: log::Level = parse_url_query_string(&query_string, "RUST_LOG")
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(log::Level::Error);
+        console_log::init_with_level(level).expect("could not initialize logger");
         std::panic::set_hook(Box::new(console_error_panic_hook::hook));
         // On wasm, append the canvas to the document body
         web_sys::window()
@@ -108,19 +122,66 @@ async fn setup<E: Example>(title: &str) -> Setup {
             .expect("couldn't append canvas to document body");
     }
 
+    #[cfg(target_arch = "wasm32")]
+    let mut offscreen_canvas_setup: Option<OffscreenCanvasSetup> = None;
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+        use winit::platform::web::WindowExtWebSys;
+
+        let query_string = web_sys::window().unwrap().location().search().unwrap();
+        if let Some(offscreen_canvas_param) =
+            parse_url_query_string(&query_string, "offscreen_canvas")
+        {
+            if FromStr::from_str(offscreen_canvas_param) == Ok(true) {
+                log::info!("Creating OffscreenCanvasSetup");
+
+                let offscreen_canvas =
+                    OffscreenCanvas::new(1024, 768).expect("couldn't create OffscreenCanvas");
+
+                let bitmap_renderer = window
+                    .canvas()
+                    .get_context("bitmaprenderer")
+                    .expect("couldn't create ImageBitmapRenderingContext (Result)")
+                    .expect("couldn't create ImageBitmapRenderingContext (Option)")
+                    .dyn_into::<ImageBitmapRenderingContext>()
+                    .expect("couldn't convert into ImageBitmapRenderingContext");
+
+                offscreen_canvas_setup = Some(OffscreenCanvasSetup {
+                    offscreen_canvas,
+                    bitmap_renderer,
+                })
+            }
+        }
+    };
+
     log::info!("Initializing the surface...");
 
-    let backend = wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::PRIMARY);
+    let backend = wgpu::util::backend_bits_from_env().unwrap_or_else(wgpu::Backends::all);
 
     let instance = wgpu::Instance::new(backend);
     let (size, surface) = unsafe {
         let size = window.inner_size();
+
+        #[cfg(not(target_arch = "wasm32"))]
         let surface = instance.create_surface(&window);
+        #[cfg(target_arch = "wasm32")]
+        let surface = {
+            if let Some(offscreen_canvas_setup) = &offscreen_canvas_setup {
+                log::info!("Creating surface from OffscreenCanvas");
+                instance
+                    .create_surface_from_offscreen_canvas(&offscreen_canvas_setup.offscreen_canvas)
+            } else {
+                instance.create_surface(&window)
+            }
+        };
+
         (size, surface)
     };
-    let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, backend)
-        .await
-        .expect("No suitable GPU adapters found on the system!");
+    let adapter =
+        wgpu::util::initialize_adapter_from_env_or_default(&instance, backend, Some(&surface))
+            .await
+            .expect("No suitable GPU adapters found on the system!");
 
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -135,6 +196,21 @@ async fn setup<E: Example>(title: &str) -> Setup {
         adapter_features.contains(required_features),
         "Adapter does not support required features for this example: {:?}",
         required_features - adapter_features
+    );
+
+    let required_downlevel_capabilities = E::required_downlevel_capabilities();
+    let downlevel_capabilities = adapter.get_downlevel_capabilities();
+    assert!(
+        downlevel_capabilities.shader_model >= required_downlevel_capabilities.shader_model,
+        "Adapter does not support the minimum shader model required to run this example: {:?}",
+        required_downlevel_capabilities.shader_model
+    );
+    assert!(
+        downlevel_capabilities
+            .flags
+            .contains(required_downlevel_capabilities.flags),
+        "Adapter does not support the downlevel capabilities required to run this example: {:?}",
+        required_downlevel_capabilities.flags - downlevel_capabilities.flags
     );
 
     // Make sure we use the texture resolution limits from the adapter, so we can support images the size of the surface.
@@ -162,11 +238,13 @@ async fn setup<E: Example>(title: &str) -> Setup {
         adapter,
         device,
         queue,
+        #[cfg(target_arch = "wasm32")]
+        offscreen_canvas_setup,
     }
 }
 
 fn start<E: Example>(
-    Setup {
+    #[cfg(not(target_arch = "wasm32"))] Setup {
         window,
         event_loop,
         instance,
@@ -176,22 +254,32 @@ fn start<E: Example>(
         device,
         queue,
     }: Setup,
+    #[cfg(target_arch = "wasm32")] Setup {
+        window,
+        event_loop,
+        instance,
+        size,
+        surface,
+        adapter,
+        device,
+        queue,
+        offscreen_canvas_setup,
+    }: Setup,
 ) {
     let spawner = Spawner::new();
     let mut config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        format: surface.get_preferred_format(&adapter).unwrap(),
+        format: surface.get_supported_formats(&adapter)[0],
         width: size.width,
         height: size.height,
-        present_mode: wgpu::PresentMode::Mailbox,
+        present_mode: wgpu::PresentMode::Fifo,
+        alpha_mode: surface.get_supported_alpha_modes(&adapter)[0],
     };
     surface.configure(&device, &config);
 
     log::info!("Initializing the example...");
     let mut example = E::init(&config, &adapter, &device, &queue);
 
-    #[cfg(not(target_arch = "wasm32"))]
-    let mut last_update_inst = Instant::now();
     #[cfg(not(target_arch = "wasm32"))]
     let mut last_frame_inst = Instant::now();
     #[cfg(not(target_arch = "wasm32"))]
@@ -208,32 +296,17 @@ fn start<E: Example>(
         match event {
             event::Event::RedrawEventsCleared => {
                 #[cfg(not(target_arch = "wasm32"))]
-                {
-                    // Clamp to some max framerate to avoid busy-looping too much
-                    // (we might be in wgpu::PresentMode::Mailbox, thus discarding superfluous frames)
-                    //
-                    // winit has window.current_monitor().video_modes() but that is a list of all full screen video modes.
-                    // So without extra dependencies it's a bit tricky to get the max refresh rate we can run the window on.
-                    // Therefore we just go with 60fps - sorry 120hz+ folks!
-                    let target_frametime = Duration::from_secs_f64(1.0 / 60.0);
-                    let time_since_last_frame = last_update_inst.elapsed();
-                    if time_since_last_frame >= target_frametime {
-                        window.request_redraw();
-                        last_update_inst = Instant::now();
-                    } else {
-                        *control_flow = ControlFlow::WaitUntil(
-                            Instant::now() + target_frametime - time_since_last_frame,
-                        );
-                    }
+                spawner.run_until_stalled();
 
-                    spawner.run_until_stalled();
-                }
-
-                #[cfg(target_arch = "wasm32")]
                 window.request_redraw();
             }
             event::Event::WindowEvent {
-                event: WindowEvent::Resized(size),
+                event:
+                    WindowEvent::Resized(size)
+                    | WindowEvent::ScaleFactorChanged {
+                        new_inner_size: &mut size,
+                        ..
+                    },
                 ..
             } => {
                 log::info!("Resizing to {:?}", size);
@@ -287,21 +360,37 @@ fn start<E: Example>(
                     }
                 }
 
-                let frame = match surface.get_current_frame() {
+                let frame = match surface.get_current_texture() {
                     Ok(frame) => frame,
                     Err(_) => {
                         surface.configure(&device, &config);
                         surface
-                            .get_current_frame()
+                            .get_current_texture()
                             .expect("Failed to acquire next surface texture!")
                     }
                 };
                 let view = frame
-                    .output
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());
 
                 example.render(&view, &device, &queue, &spawner);
+
+                frame.present();
+
+                #[cfg(target_arch = "wasm32")]
+                {
+                    if let Some(offscreen_canvas_setup) = &offscreen_canvas_setup {
+                        let image_bitmap = offscreen_canvas_setup
+                            .offscreen_canvas
+                            .transfer_to_image_bitmap()
+                            .expect("couldn't transfer offscreen canvas to image bitmap.");
+                        offscreen_canvas_setup
+                            .bitmap_renderer
+                            .transfer_from_image_bitmap(&image_bitmap);
+
+                        log::info!("Transferring OffscreenCanvas to ImageBitmapRenderer");
+                    }
+                }
             }
             _ => {}
         }
@@ -382,6 +471,25 @@ pub fn run<E: Example>(title: &str) {
     });
 }
 
+#[cfg(target_arch = "wasm32")]
+/// Parse the query string as returned by `web_sys::window()?.location().search()?` and get a
+/// specific key out of it.
+pub fn parse_url_query_string<'a>(query: &'a str, search_key: &str) -> Option<&'a str> {
+    let query_string = query.strip_prefix('?')?;
+
+    for pair in query_string.split('&') {
+        let mut pair = pair.split('=');
+        let key = pair.next()?;
+        let value = pair.next()?;
+
+        if key == search_key {
+            return Some(value);
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 pub struct FrameworkRefTest {
     pub image_path: &'static str,
@@ -401,12 +509,9 @@ pub fn test<E: Example>(mut params: FrameworkRefTest) {
     assert_eq!(params.width % 64, 0, "width needs to be aligned 64");
 
     let features = E::required_features() | params.optional_features;
-    let limits = E::required_limits();
 
     test_common::initialize_test(
-        mem::take(&mut params.base_test_parameters)
-            .features(features)
-            .limits(limits),
+        mem::take(&mut params.base_test_parameters).features(features),
         |ctx| {
             let spawner = Spawner::new();
 
@@ -440,6 +545,7 @@ pub fn test<E: Example>(mut params: FrameworkRefTest) {
                     width: params.width,
                     height: params.height,
                     present_mode: wgpu::PresentMode::Fifo,
+                    alpha_mode: wgpu::CompositeAlphaMode::Auto,
                 },
                 &ctx.adapter,
                 &ctx.device,
@@ -447,6 +553,27 @@ pub fn test<E: Example>(mut params: FrameworkRefTest) {
             );
 
             example.render(&dst_view, &ctx.device, &ctx.queue, &spawner);
+
+            // Handle specific case for bunnymark
+            #[allow(deprecated)]
+            if params.image_path == "/examples/bunnymark/screenshot.png" {
+                // Press spacebar to spawn bunnies
+                example.update(winit::event::WindowEvent::KeyboardInput {
+                    input: winit::event::KeyboardInput {
+                        scancode: 0,
+                        state: winit::event::ElementState::Pressed,
+                        virtual_keycode: Some(winit::event::VirtualKeyCode::Space),
+                        modifiers: winit::event::ModifiersState::empty(),
+                    },
+                    device_id: unsafe { winit::event::DeviceId::dummy() },
+                    is_synthetic: false,
+                });
+
+                // Step 3 extra frames
+                for _ in 0..3 {
+                    example.render(&dst_view, &ctx.device, &ctx.queue, &spawner);
+                }
+            }
 
             let mut cmd_buf = ctx
                 .device
@@ -477,7 +604,7 @@ pub fn test<E: Example>(mut params: FrameworkRefTest) {
             ctx.queue.submit(Some(cmd_buf.finish()));
 
             let dst_buffer_slice = dst_buffer.slice(..);
-            let _ = dst_buffer_slice.map_async(wgpu::MapMode::Read);
+            dst_buffer_slice.map_async(wgpu::MapMode::Read, |_| ());
             ctx.device.poll(wgpu::Maintain::Wait);
             let bytes = dst_buffer_slice.get_mapped_range().to_vec();
 

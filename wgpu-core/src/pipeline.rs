@@ -5,12 +5,28 @@ use crate::{
     id::{DeviceId, PipelineLayoutId, ShaderModuleId},
     validation, Label, LifeGuard, Stored,
 };
-use std::borrow::Cow;
+use arrayvec::ArrayVec;
+use std::{borrow::Cow, error::Error, fmt, marker::PhantomData, num::NonZeroU32};
 use thiserror::Error;
 
+/// Information about buffer bindings, which
+/// is validated against the shader (and pipeline)
+/// at draw time as opposed to initialization time.
+#[derive(Debug)]
+pub(crate) struct LateSizedBufferGroup {
+    // The order has to match `BindGroup::late_buffer_binding_sizes`.
+    pub(crate) shader_sizes: Vec<wgt::BufferAddress>,
+}
+
+#[allow(clippy::large_enum_variant)]
 pub enum ShaderModuleSource<'a> {
+    #[cfg(feature = "wgsl")]
     Wgsl(Cow<'a, str>),
-    Naga(naga::Module),
+    Naga(Cow<'static, naga::Module>),
+    /// Dummy variant because `Naga` doesn't have a lifetime and without enough active features it
+    /// could be the last one active.
+    #[doc(hidden)]
+    Dummy(PhantomData<&'a ()>),
 }
 
 #[derive(Clone, Debug)]
@@ -18,6 +34,8 @@ pub enum ShaderModuleSource<'a> {
 #[cfg_attr(feature = "replay", derive(serde::Deserialize))]
 pub struct ShaderModuleDescriptor<'a> {
     pub label: Label<'a>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub shader_bound_checks: wgt::ShaderBoundChecks,
 }
 
 #[derive(Debug)]
@@ -44,33 +62,94 @@ impl<A: hal::Api> Resource for ShaderModule<A> {
     }
 }
 
-#[derive(Clone, Debug, Error)]
-pub struct NagaParseError {
-    pub shader_source: String,
-    pub error: naga::front::wgsl::ParseError,
+#[derive(Clone, Debug)]
+pub struct ShaderError<E> {
+    pub source: String,
+    pub label: Option<String>,
+    pub inner: E,
 }
-impl std::fmt::Display for NagaParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+#[cfg(feature = "wgsl")]
+impl fmt::Display for ShaderError<naga::front::wgsl::ParseError> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = self.label.as_deref().unwrap_or_default();
+        let string = self.inner.emit_to_string(&self.source);
+        write!(f, "\nShader '{}' parsing {}", label, string)
+    }
+}
+impl fmt::Display for ShaderError<naga::WithSpan<naga::valid::ValidationError>> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use codespan_reporting::{
+            diagnostic::{Diagnostic, Label},
+            files::SimpleFile,
+            term,
+        };
+
+        let label = self.label.as_deref().unwrap_or_default();
+        let files = SimpleFile::new(label, &self.source);
+        let config = term::Config::default();
+        let mut writer = term::termcolor::Ansi::new(Vec::new());
+
+        let diagnostic = Diagnostic::error().with_labels(
+            self.inner
+                .spans()
+                .map(|&(span, ref desc)| {
+                    Label::primary((), span.to_range().unwrap()).with_message(desc.to_owned())
+                })
+                .collect(),
+        );
+
+        term::emit(&mut writer, &config, &files, &diagnostic).expect("cannot write error");
+
         write!(
             f,
-            "\nShader error:\n{}",
-            self.error.emit_to_string(&self.shader_source)
+            "\nShader validation {}",
+            String::from_utf8_lossy(&writer.into_inner())
         )
     }
 }
+impl<E> Error for ShaderError<E>
+where
+    ShaderError<E>: fmt::Display,
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.inner)
+    }
+}
 
-#[derive(Clone, Debug, Error)]
+//Note: `Clone` would require `WithSpan: Clone`.
+#[derive(Debug, Error)]
 pub enum CreateShaderModuleError {
-    #[error("Failed to parse a shader")]
-    Parsing(#[from] NagaParseError),
+    #[cfg(feature = "wgsl")]
+    #[error(transparent)]
+    Parsing(#[from] ShaderError<naga::front::wgsl::ParseError>),
     #[error("Failed to generate the backend-specific code")]
     Generation,
     #[error(transparent)]
     Device(#[from] DeviceError),
     #[error(transparent)]
-    Validation(#[from] naga::valid::ValidationError),
+    Validation(#[from] ShaderError<naga::WithSpan<naga::valid::ValidationError>>),
     #[error(transparent)]
     MissingFeatures(#[from] MissingFeatures),
+    #[error(
+        "shader global {bind:?} uses a group index {group} that exceeds the max_bind_groups limit of {limit}."
+    )]
+    InvalidGroupIndex {
+        bind: naga::ResourceBinding,
+        group: u32,
+        limit: u32,
+    },
+}
+
+impl CreateShaderModuleError {
+    pub fn location(&self, source: &str) -> Option<naga::SourceLocation> {
+        match *self {
+            #[cfg(feature = "wgsl")]
+            CreateShaderModuleError::Parsing(ref err) => err.inner.location(source),
+            CreateShaderModuleError::Validation(ref err) => err.inner.location(source),
+            _ => None,
+        }
+    }
 }
 
 /// Describes a programmable pipeline stage.
@@ -80,8 +159,8 @@ pub enum CreateShaderModuleError {
 pub struct ProgrammableStageDescriptor<'a> {
     /// The compiled shader module for this stage.
     pub module: ShaderModuleId,
-    /// The name of the entry point in the compiled shader. There must be a function that returns
-    /// void with this name in the shader.
+    /// The name of the entry point in the compiled shader. There must be a function with this name
+    /// in the shader.
     pub entry_point: Cow<'a, str>,
 }
 
@@ -133,6 +212,7 @@ pub struct ComputePipeline<A: hal::Api> {
     pub(crate) raw: A::ComputePipeline,
     pub(crate) layout_id: Stored<PipelineLayoutId>,
     pub(crate) device_id: Stored<DeviceId>,
+    pub(crate) late_sized_buffer_groups: ArrayVec<LateSizedBufferGroup, { hal::MAX_BIND_GROUPS }>,
     pub(crate) life_guard: LifeGuard,
 }
 
@@ -148,6 +228,7 @@ impl<A: hal::Api> Resource for ComputePipeline<A> {
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "trace", derive(serde::Serialize))]
 #[cfg_attr(feature = "replay", derive(serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
 pub struct VertexBufferLayout<'a> {
     /// The stride, in bytes, between elements of this buffer.
     pub array_stride: wgt::BufferAddress,
@@ -176,7 +257,7 @@ pub struct FragmentState<'a> {
     /// The compiled fragment stage and its entry point.
     pub stage: ProgrammableStageDescriptor<'a>,
     /// The effect of draw calls on the color aspect of the output target.
-    pub targets: Cow<'a, [wgt::ColorTargetState]>,
+    pub targets: Cow<'a, [Option<wgt::ColorTargetState>]>,
 }
 
 /// Describes a render (graphics) pipeline.
@@ -200,18 +281,21 @@ pub struct RenderPipelineDescriptor<'a> {
     pub multisample: wgt::MultisampleState,
     /// The fragment processing state for this pipeline.
     pub fragment: Option<FragmentState<'a>>,
+    /// If the pipeline will be used with a multiview render pass, this indicates how many array
+    /// layers the attachments will have.
+    pub multiview: Option<NonZeroU32>,
 }
 
 #[derive(Clone, Debug, Error)]
 pub enum ColorStateError {
-    #[error("output is missing")]
-    Missing,
     #[error("format {0:?} is not renderable")]
     FormatNotRenderable(wgt::TextureFormat),
     #[error("format {0:?} is not blendable")]
     FormatNotBlendable(wgt::TextureFormat),
     #[error("format {0:?} does not have a color aspect")]
     FormatNotColor(wgt::TextureFormat),
+    #[error("format {0:?} can't be multisampled")]
+    FormatNotMultisampled(wgt::TextureFormat),
     #[error("output format {pipeline} is incompatible with the shader {shader}")]
     IncompatibleFormat {
         pipeline: validation::NumericType,
@@ -229,6 +313,8 @@ pub enum DepthStencilStateError {
     FormatNotDepth(wgt::TextureFormat),
     #[error("format {0:?} does not have a stencil aspect, but stencil test/write is enabled")]
     FormatNotStencil(wgt::TextureFormat),
+    #[error("format {0:?} can't be multisampled")]
+    FormatNotMultisampled(wgt::TextureFormat),
 }
 
 #[derive(Clone, Debug, Error)]
@@ -245,6 +331,8 @@ pub enum CreateRenderPipelineError {
     DepthStencilState(#[from] DepthStencilStateError),
     #[error("invalid sample count {0}")]
     InvalidSampleCount(u32),
+    #[error("the number of color attachments {given} exceeds the limit {limit}")]
+    TooManyColorAttachments { given: u32, limit: u32 },
     #[error("the number of vertex buffers {given} exceeds the limit {limit}")]
     TooManyVertexBuffers { given: u32, limit: u32 },
     #[error("the total number of vertex attributes {given} exceeds the limit {limit}")]
@@ -290,7 +378,27 @@ bitflags::bitflags! {
     pub struct PipelineFlags: u32 {
         const BLEND_CONSTANT = 1 << 0;
         const STENCIL_REFERENCE = 1 << 1;
-        const WRITES_DEPTH_STENCIL = 1 << 2;
+        const WRITES_DEPTH = 1 << 2;
+        const WRITES_STENCIL = 1 << 3;
+    }
+}
+
+/// How a render pipeline will retrieve attributes from a particular vertex buffer.
+#[derive(Clone, Copy, Debug)]
+pub struct VertexStep {
+    /// The byte stride in the buffer between one attribute value and the next.
+    pub stride: wgt::BufferAddress,
+
+    /// Whether the buffer is indexed by vertex number or instance number.
+    pub mode: wgt::VertexStepMode,
+}
+
+impl Default for VertexStep {
+    fn default() -> Self {
+        Self {
+            stride: 0,
+            mode: wgt::VertexStepMode::Vertex,
+        }
     }
 }
 
@@ -302,7 +410,8 @@ pub struct RenderPipeline<A: hal::Api> {
     pub(crate) pass_context: RenderPassContext,
     pub(crate) flags: PipelineFlags,
     pub(crate) strip_index_format: Option<wgt::IndexFormat>,
-    pub(crate) vertex_strides: Vec<(wgt::BufferAddress, wgt::VertexStepMode)>,
+    pub(crate) vertex_steps: Vec<VertexStep>,
+    pub(crate) late_sized_buffer_groups: ArrayVec<LateSizedBufferGroup, { hal::MAX_BIND_GROUPS }>,
     pub(crate) life_guard: LifeGuard,
 }
 

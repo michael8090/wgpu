@@ -4,9 +4,9 @@ mod framework;
 mod point_gen;
 
 use bytemuck::{Pod, Zeroable};
-use cgmath::Point3;
-use rand::SeedableRng;
-use std::{borrow::Cow, iter, mem};
+use glam::Vec3;
+use nanorand::{Rng, WyRand};
+use std::{borrow::Cow, f32::consts, iter, mem};
 use wgpu::util::DeviceExt;
 
 ///
@@ -23,16 +23,12 @@ const SIZE: f32 = 29.0;
 /// Location of the camera.
 /// Location of light is in terrain/water shaders.
 ///
-const CAMERA: Point3<f32> = Point3 {
-    x: -200.0,
-    y: 70.0,
-    z: 200.0,
-};
+const CAMERA: Vec3 = glam::Vec3::new(-200.0, 70.0, 200.0);
 
 struct Matrices {
-    view: cgmath::Matrix4<f32>,
-    flipped_view: cgmath::Matrix4<f32>,
-    projection: cgmath::Matrix4<f32>,
+    view: glam::Mat4,
+    flipped_view: glam::Mat4,
+    projection: glam::Mat4,
 }
 
 #[repr(C)]
@@ -68,11 +64,6 @@ struct Example {
     terrain_vertex_buf: wgpu::Buffer,
     terrain_vertex_count: usize,
     terrain_normal_bind_group: wgpu::BindGroup,
-    ///
-    /// Binds to the uniform buffer where the
-    /// camera has been placed underwater.
-    ///
-    terrain_flipped_bind_group: wgpu::BindGroup,
     terrain_normal_uniform_buf: wgpu::Buffer,
     ///
     /// Contains uniform variables where the camera
@@ -80,6 +71,13 @@ struct Example {
     ///
     terrain_flipped_uniform_buf: wgpu::Buffer,
     terrain_pipeline: wgpu::RenderPipeline,
+
+    /// A render bundle for drawing the terrain.
+    ///
+    /// This isn't really necessary, but it does make sure we have at
+    /// least one use of `RenderBundleEncoder::set_bind_group` among
+    /// the examples.
+    terrain_bundle: wgpu::RenderBundle,
 
     reflect_view: wgpu::TextureView,
 
@@ -99,31 +97,29 @@ impl Example {
     /// Creates the view matrices, and the corrected projection matrix.
     ///
     fn generate_matrices(aspect_ratio: f32) -> Matrices {
-        let projection = cgmath::perspective(cgmath::Deg(45f32), aspect_ratio, 10.0, 400.0);
-        let reg_view = cgmath::Matrix4::look_at_rh(
+        let projection = glam::Mat4::perspective_rh(consts::FRAC_PI_4, aspect_ratio, 10.0, 400.0);
+        let reg_view = glam::Mat4::look_at_rh(
             CAMERA,
-            cgmath::Point3::new(0f32, 0.0, 0.0),
-            cgmath::Vector3::unit_y(), //Note that y is up. Differs from other examples.
+            glam::Vec3::new(0f32, 0.0, 0.0),
+            glam::Vec3::Y, //Note that y is up. Differs from other examples.
         );
 
-        let scale = cgmath::Matrix4::from_nonuniform_scale(8.0, 1.5, 8.0);
+        let scale = glam::Mat4::from_scale(glam::Vec3::new(8.0, 1.5, 8.0));
 
         let reg_view = reg_view * scale;
 
-        let flipped_view = cgmath::Matrix4::look_at_rh(
-            cgmath::Point3::new(CAMERA.x, -CAMERA.y, CAMERA.z),
-            cgmath::Point3::new(0f32, 0.0, 0.0),
-            cgmath::Vector3::unit_y(),
+        let flipped_view = glam::Mat4::look_at_rh(
+            glam::Vec3::new(CAMERA.x, -CAMERA.y, CAMERA.z),
+            glam::Vec3::ZERO,
+            glam::Vec3::Y,
         );
-
-        let correction = framework::OPENGL_TO_WGPU_MATRIX;
 
         let flipped_view = flipped_view * scale;
 
         Matrices {
             view: reg_view,
             flipped_view,
-            projection: correction * projection,
+            projection,
         }
     }
 
@@ -215,14 +211,19 @@ impl Example {
                 | wgpu::TextureUsages::RENDER_ATTACHMENT,
         });
 
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Texture Sampler"),
+        let color_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Color Sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let depth_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Depth Sampler"),
             ..Default::default()
         });
 
@@ -247,7 +248,11 @@ impl Example {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
+                    resource: wgpu::BindingResource::Sampler(&color_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&depth_sampler),
                 },
             ],
             label: Some("Water Bind Group"),
@@ -280,13 +285,12 @@ impl framework::Example for Example {
         let terrain_noise = noise::OpenSimplex::new();
 
         // Random colouration
-        let mut terrain_random = rand::rngs::StdRng::seed_from_u64(42);
+        let mut terrain_random = WyRand::new_seed(42);
 
         // Generate terrain. The closure determines what each hexagon will look like.
         let terrain =
             point_gen::HexTerrainMesh::generate(SIZE, |point| -> point_gen::TerrainVertex {
                 use noise::NoiseFn;
-                use rand::Rng;
                 let noise = terrain_noise.get([point[0] as f64 / 5.0, point[1] as f64 / 5.0]) + 0.1;
 
                 let y = noise as f32 * 22.0;
@@ -309,7 +313,7 @@ impl framework::Example for Example {
                 const SNOW: [u8; 4] = [175, 224, 237, 255];
 
                 // Random colouration.
-                let random = terrain_random.gen::<f32>() * 0.2 + 0.9;
+                let random = terrain_random.generate::<f32>() * 0.2 + 0.9;
 
                 // Choose colour.
                 let colour = if y <= 0.0 {
@@ -322,11 +326,7 @@ impl framework::Example for Example {
                     SNOW
                 };
                 point_gen::TerrainVertex {
-                    position: Point3 {
-                        x: point[0],
-                        y,
-                        z: point[1],
-                    },
+                    position: Vec3::new(point[0], y, point[1]),
                     colour: mul_arr(colour, random),
                 }
             });
@@ -391,10 +391,14 @@ impl framework::Example for Example {
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler {
-                            comparison: false,
-                            filtering: true,
-                        },
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // Sampler to be able to sample the textures.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                         count: None,
                     },
                 ],
@@ -477,6 +481,9 @@ impl framework::Example for Example {
             }],
             label: Some("Terrain Normal Bind Group"),
         });
+
+        // Binds to the uniform buffer where the
+        // camera has been placed underwater.
         let terrain_flipped_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &terrain_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
@@ -487,11 +494,11 @@ impl framework::Example for Example {
         });
 
         // Upload/compile them to GPU code.
-        let terrain_module = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        let terrain_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("terrain"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("terrain.wgsl"))),
         });
-        let water_module = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        let water_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("water"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("water.wgsl"))),
         });
@@ -523,7 +530,7 @@ impl framework::Example for Example {
                 entry_point: "fs_main",
                 // Describes how the colour will be interpolated
                 // and assigned to the output attachment.
-                targets: &[wgpu::ColorTargetState {
+                targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(wgpu::BlendState {
                         color: wgpu::BlendComponent {
@@ -538,7 +545,7 @@ impl framework::Example for Example {
                         },
                     }),
                     write_mask: wgpu::ColorWrites::ALL,
-                }],
+                })],
             }),
             // How the triangles will be rasterized. This is more important
             // for the terrain because of the beneath-the water shot.
@@ -565,6 +572,7 @@ impl framework::Example for Example {
             }),
             // No multisampling is used.
             multisample: wgpu::MultisampleState::default(),
+            multiview: None,
         });
 
         // Same idea as the water pipeline.
@@ -583,7 +591,7 @@ impl framework::Example for Example {
             fragment: Some(wgpu::FragmentState {
                 module: &terrain_module,
                 entry_point: "fs_main",
-                targets: &[config.format.into()],
+                targets: &[Some(config.format.into())],
             }),
             primitive: wgpu::PrimitiveState {
                 front_face: wgpu::FrontFace::Ccw,
@@ -598,7 +606,29 @@ impl framework::Example for Example {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
+            multiview: None,
         });
+
+        // A render bundle to draw the terrain.
+        let terrain_bundle = {
+            let mut encoder =
+                device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
+                    label: None,
+                    color_formats: &[Some(config.format)],
+                    depth_stencil: Some(wgpu::RenderBundleDepthStencil {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_read_only: false,
+                        stencil_read_only: true,
+                    }),
+                    sample_count: 1,
+                    multiview: None,
+                });
+            encoder.set_pipeline(&terrain_pipeline);
+            encoder.set_bind_group(0, &terrain_flipped_bind_group, &[]);
+            encoder.set_vertex_buffer(0, terrain_vertex_buf.slice(..));
+            encoder.draw(0..terrain_vertices.len() as u32, 0..1);
+            encoder.finish(&wgpu::RenderBundleDescriptor::default())
+        };
 
         // Done
         Example {
@@ -612,10 +642,10 @@ impl framework::Example for Example {
             terrain_vertex_buf,
             terrain_vertex_count: terrain_vertices.len(),
             terrain_normal_bind_group,
-            terrain_flipped_bind_group,
             terrain_normal_uniform_buf,
             terrain_flipped_uniform_buf,
             terrain_pipeline,
+            terrain_bundle,
 
             reflect_view,
 
@@ -705,14 +735,14 @@ impl framework::Example for Example {
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.reflect_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(back_color),
                         store: true,
                     },
-                }],
+                })],
                 // We still need to use the depth buffer here
                 // since the pipeline requires it.
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -724,24 +754,22 @@ impl framework::Example for Example {
                     stencil_ops: None,
                 }),
             });
-            rpass.set_pipeline(&self.terrain_pipeline);
-            rpass.set_bind_group(0, &self.terrain_flipped_bind_group, &[]);
-            rpass.set_vertex_buffer(0, self.terrain_vertex_buf.slice(..));
-            rpass.draw(0..self.terrain_vertex_count as u32, 0..1);
+
+            rpass.execute_bundles([&self.terrain_bundle]);
         }
         // Terrain right side up. This time we need to use the
         // depth values, so we must use StoreOp::Store.
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(back_color),
                         store: true,
                     },
-                }],
+                })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_buffer,
                     depth_ops: Some(wgpu::Operations {
@@ -761,14 +789,14 @@ impl framework::Example for Example {
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: true,
                     },
-                }],
+                })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_buffer,
                     depth_ops: None,
@@ -801,6 +829,6 @@ fn water() {
             .downlevel_flags(wgpu::DownlevelFlags::READ_ONLY_DEPTH_STENCIL)
             .specific_failure(Some(wgpu::Backends::DX12), None, Some("Basic"), false), // WARP has a bug https://github.com/gfx-rs/wgpu/issues/1730
         tolerance: 5,
-        max_outliers: 460, // bounded by DX12, then rpi4 on vk
+        max_outliers: 470, // bounded by DX12, then AMD Radeon Polaris12 on vk linux
     });
 }

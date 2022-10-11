@@ -2,11 +2,11 @@
 mod framework;
 
 use bytemuck::{Pod, Zeroable};
-use std::{borrow::Cow, mem, num::NonZeroU32};
+use std::{borrow::Cow, f32::consts, mem, num::NonZeroU32};
 use wgpu::util::DeviceExt;
 
 const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
-const MIP_LEVEL_COUNT: u32 = 9;
+const MIP_LEVEL_COUNT: u32 = 10;
 const MIP_PASS_COUNT: u32 = MIP_LEVEL_COUNT - 1;
 
 fn create_texels(size: usize, cx: f32, cy: f32) -> Vec<u8> {
@@ -46,11 +46,12 @@ struct TimestampData {
     end: u64,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct QueryData {
-    timestamps: [TimestampData; MIP_PASS_COUNT as usize],
-    pipeline_queries: [u64; MIP_PASS_COUNT as usize],
+type TimestampQueries = [TimestampData; MIP_PASS_COUNT as usize];
+type PipelineStatisticsQueries = [u64; MIP_PASS_COUNT as usize];
+
+fn pipeline_statistics_offset() -> wgpu::BufferAddress {
+    (mem::size_of::<TimestampQueries>() as wgpu::BufferAddress)
+        .max(wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT)
 }
 
 struct Example {
@@ -60,15 +61,14 @@ struct Example {
 }
 
 impl Example {
-    fn generate_matrix(aspect_ratio: f32) -> cgmath::Matrix4<f32> {
-        let mx_projection = cgmath::perspective(cgmath::Deg(45f32), aspect_ratio, 1.0, 1000.0);
-        let mx_view = cgmath::Matrix4::look_at_rh(
-            cgmath::Point3::new(0f32, 0.0, 10.0),
-            cgmath::Point3::new(0f32, 50.0, 0.0),
-            cgmath::Vector3::unit_z(),
+    fn generate_matrix(aspect_ratio: f32) -> glam::Mat4 {
+        let projection = glam::Mat4::perspective_rh(consts::FRAC_PI_4, aspect_ratio, 1.0, 1000.0);
+        let view = glam::Mat4::look_at_rh(
+            glam::Vec3::new(0f32, 0.0, 10.0),
+            glam::Vec3::new(0f32, 50.0, 0.0),
+            glam::Vec3::Z,
         );
-        let mx_correction = framework::OPENGL_TO_WGPU_MATRIX;
-        mx_correction * mx_projection * mx_view
+        projection * view
     }
 
     fn generate_mipmaps(
@@ -78,7 +78,7 @@ impl Example {
         query_sets: &Option<QuerySets>,
         mip_count: u32,
     ) {
-        let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("blit.wgsl"))),
         });
@@ -94,14 +94,15 @@ impl Example {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: "fs_main",
-                targets: &[TEXTURE_FORMAT.into()],
+                targets: &[Some(TEXTURE_FORMAT.into())],
             }),
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                topology: wgpu::PrimitiveTopology::TriangleList,
                 ..Default::default()
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
+            multiview: None,
         });
 
         let bind_group_layout = pipeline.get_bind_group_layout(0);
@@ -112,7 +113,7 @@ impl Example {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
@@ -153,14 +154,14 @@ impl Example {
 
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &views[target_mip],
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
                         store: true,
                     },
-                }],
+                })],
                 depth_stencil_attachment: None,
             });
             if let Some(ref query_sets) = query_sets {
@@ -172,7 +173,7 @@ impl Example {
             }
             rpass.set_pipeline(&pipeline);
             rpass.set_bind_group(0, &bind_group, &[]);
-            rpass.draw(0..4, 0..1);
+            rpass.draw(0..3, 0..1);
             if let Some(ref query_sets) = query_sets {
                 rpass.write_timestamp(&query_sets.timestamp, timestamp_query_index_base + 1);
                 rpass.end_pipeline_statistics_query();
@@ -191,7 +192,7 @@ impl Example {
                 &query_sets.pipeline_statistics,
                 0..MIP_PASS_COUNT,
                 &query_sets.data_buffer,
-                (timestamp_query_count * mem::size_of::<u64>() as u32) as wgpu::BufferAddress,
+                pipeline_statistics_offset(),
             );
         }
     }
@@ -199,7 +200,9 @@ impl Example {
 
 impl framework::Example for Example {
     fn optional_features() -> wgpu::Features {
-        wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::PIPELINE_STATISTICS_QUERY
+        wgpu::Features::TIMESTAMP_QUERY
+            | wgpu::Features::PIPELINE_STATISTICS_QUERY
+            | wgpu::Features::WRITE_TIMESTAMP_INSIDE_PASSES
     }
 
     fn init(
@@ -212,7 +215,7 @@ impl framework::Example for Example {
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
         // Create the texture
-        let size = 1 << MIP_LEVEL_COUNT;
+        let size = 1 << MIP_PASS_COUNT;
         let texels = create_texels(size as usize, -0.8, 0.156);
         let texture_extent = wgpu::Extent3d {
             width: size,
@@ -271,7 +274,7 @@ impl framework::Example for Example {
         });
 
         // Create the render pipeline
-        let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("draw.wgsl"))),
         });
@@ -287,7 +290,7 @@ impl framework::Example for Example {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: "fs_main",
-                targets: &[config.format.into()],
+                targets: &[Some(config.format.into())],
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleStrip,
@@ -297,6 +300,7 @@ impl framework::Example for Example {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
+            multiview: None,
         });
 
         // Create bind group
@@ -321,10 +325,11 @@ impl framework::Example for Example {
         });
 
         // If both kinds of query are supported, use queries
-        let query_sets = if device
-            .features()
-            .contains(wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::PIPELINE_STATISTICS_QUERY)
-        {
+        let query_sets = if device.features().contains(
+            wgpu::Features::TIMESTAMP_QUERY
+                | wgpu::Features::PIPELINE_STATISTICS_QUERY
+                | wgpu::Features::WRITE_TIMESTAMP_INSIDE_PASSES,
+        ) {
             // For N total mips, it takes N - 1 passes to generate them, and we're measuring those.
             let mip_passes = MIP_LEVEL_COUNT - 1;
 
@@ -352,9 +357,8 @@ impl framework::Example for Example {
             // and 1 * passes statistics queries. Each query returns a u64 value.
             let data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("query buffer"),
-                size: mip_passes as wgpu::BufferAddress
-                    * 3
-                    * mem::size_of::<u64>() as wgpu::BufferAddress,
+                size: pipeline_statistics_offset()
+                    + mem::size_of::<PipelineStatisticsQueries>() as wgpu::BufferAddress,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
@@ -379,22 +383,30 @@ impl framework::Example for Example {
 
         queue.submit(Some(init_encoder.finish()));
         if let Some(ref query_sets) = query_sets {
-            // We can ignore the future as we're about to wait for the device.
-            let _ = query_sets
+            // We can ignore the callback as we're about to wait for the device.
+            query_sets
                 .data_buffer
                 .slice(..)
-                .map_async(wgpu::MapMode::Read);
+                .map_async(wgpu::MapMode::Read, |_| ());
             // Wait for device to be done rendering mipmaps
             device.poll(wgpu::Maintain::Wait);
             // This is guaranteed to be ready.
-            let view = query_sets.data_buffer.slice(..).get_mapped_range();
+            let timestamp_view = query_sets
+                .data_buffer
+                .slice(..mem::size_of::<TimestampQueries>() as wgpu::BufferAddress)
+                .get_mapped_range();
+            let pipeline_stats_view = query_sets
+                .data_buffer
+                .slice(pipeline_statistics_offset()..)
+                .get_mapped_range();
             // Convert the raw data into a useful structure
-            let data: &QueryData = bytemuck::from_bytes(&*view);
+            let timestamp_data: &TimestampQueries = bytemuck::from_bytes(&*timestamp_view);
+            let pipeline_stats_data: &PipelineStatisticsQueries =
+                bytemuck::from_bytes(&*pipeline_stats_view);
             // Iterate over the data
-            for (idx, (timestamp, pipeline)) in data
-                .timestamps
+            for (idx, (timestamp, pipeline)) in timestamp_data
                 .iter()
-                .zip(data.pipeline_queries.iter())
+                .zip(pipeline_stats_data.iter())
                 .enumerate()
             {
                 // Figure out the timestamp differences and multiply by the period to get nanoseconds
@@ -452,14 +464,14 @@ impl framework::Example for Example {
             };
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear_color),
                         store: true,
                     },
-                }],
+                })],
                 depth_stencil_attachment: None,
             });
             rpass.set_pipeline(&self.draw_pipeline);

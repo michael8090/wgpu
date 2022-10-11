@@ -1,13 +1,16 @@
 #![allow(clippy::type_complexity)]
 
+use js_sys::Promise;
 use std::{
+    cell::RefCell,
     fmt,
     future::Future,
     ops::Range,
     pin::Pin,
+    rc::Rc,
     task::{self, Poll},
 };
-use wasm_bindgen::prelude::*;
+use wasm_bindgen::{prelude::*, JsCast};
 
 // We need to make a wrapper for some of the handle types returned by the web backend to make them
 // implement `Send` and `Sync` to match native.
@@ -29,6 +32,22 @@ unsafe impl Sync for Context {}
 impl fmt::Debug for Context {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Context").field("type", &"Web").finish()
+    }
+}
+
+impl crate::Error {
+    fn from_js(js_error: js_sys::Object) -> Self {
+        let source = Box::<dyn std::error::Error + Send + Sync>::from("<WebGPU Error>");
+        if let Some(js_error) = js_error.dyn_ref::<web_sys::GpuValidationError>() {
+            crate::Error::Validation {
+                source,
+                description: js_error.message(),
+            }
+        } else if js_error.has_type::<web_sys::GpuOutOfMemoryError>() {
+            crate::Error::OutOfMemory { source }
+        } else {
+            panic!("Unexpected error");
+        }
     }
 }
 
@@ -112,20 +131,21 @@ impl crate::ComputePassInner<Context> for ComputePass {
         // self.0.pop_debug_group();
     }
 
-    fn dispatch(&mut self, x: u32, y: u32, z: u32) {
-        self.0.dispatch_with_y_and_z(x, y, z);
+    fn dispatch_workgroups(&mut self, x: u32, y: u32, z: u32) {
+        self.0
+            .dispatch_workgroups_with_workgroup_count_y_and_workgroup_count_z(x, y, z);
     }
-    fn dispatch_indirect(
+    fn dispatch_workgroups_indirect(
         &mut self,
         indirect_buffer: &Sendable<web_sys::GpuBuffer>,
         indirect_offset: wgt::BufferAddress,
     ) {
         self.0
-            .dispatch_indirect_with_f64(&indirect_buffer.0, indirect_offset as f64);
+            .dispatch_workgroups_indirect_with_f64(&indirect_buffer.0, indirect_offset as f64);
     }
 
     fn write_timestamp(&mut self, _query_set: &(), _query_index: u32) {
-        // Not available in gecko yet
+        panic!("WRITE_TIMESTAMP_INSIDE_PASSES feature must be enabled to call write_timestamp in a compute pass")
     }
 
     fn begin_pipeline_statistics_query(&mut self, _query_set: &(), _query_index: u32) {
@@ -163,16 +183,23 @@ impl crate::RenderInner<Context> for RenderPass {
         offset: wgt::BufferAddress,
         size: Option<wgt::BufferSize>,
     ) {
-        let mapped_size = match size {
-            Some(s) => s.get() as f64,
-            None => 0f64,
+        match size {
+            Some(s) => {
+                self.0.set_index_buffer_with_f64_and_f64(
+                    &buffer.0,
+                    map_index_format(index_format),
+                    offset as f64,
+                    s.get() as f64,
+                );
+            }
+            None => {
+                self.0.set_index_buffer_with_f64(
+                    &buffer.0,
+                    map_index_format(index_format),
+                    offset as f64,
+                );
+            }
         };
-        self.0.set_index_buffer_with_f64_and_f64(
-            &buffer.0,
-            map_index_format(index_format),
-            offset as f64,
-            mapped_size,
-        );
     }
     fn set_vertex_buffer(
         &mut self,
@@ -181,12 +208,20 @@ impl crate::RenderInner<Context> for RenderPass {
         offset: wgt::BufferAddress,
         size: Option<wgt::BufferSize>,
     ) {
-        let mapped_size = match size {
-            Some(s) => s.get() as f64,
-            None => 0f64,
+        match size {
+            Some(s) => {
+                self.0.set_vertex_buffer_with_f64_and_f64(
+                    slot,
+                    &buffer.0,
+                    offset as f64,
+                    s.get() as f64,
+                );
+            }
+            None => {
+                self.0
+                    .set_vertex_buffer_with_f64(slot, &buffer.0, offset as f64);
+            }
         };
-        self.0
-            .set_vertex_buffer_with_f64_and_f64(slot, &buffer.0, offset as f64, mapped_size);
     }
     fn set_push_constants(&mut self, _stages: wgt::ShaderStages, _offset: u32, _data: &[u8]) {
         panic!("PUSH_CONSTANTS feature must be enabled to call multi_draw_indexed_indirect")
@@ -292,16 +327,23 @@ impl crate::RenderInner<Context> for RenderBundleEncoder {
         offset: wgt::BufferAddress,
         size: Option<wgt::BufferSize>,
     ) {
-        let mapped_size = match size {
-            Some(s) => s.get() as f64,
-            None => 0f64,
+        match size {
+            Some(s) => {
+                self.0.set_index_buffer_with_f64_and_f64(
+                    &buffer.0,
+                    map_index_format(index_format),
+                    offset as f64,
+                    s.get() as f64,
+                );
+            }
+            None => {
+                self.0.set_index_buffer_with_f64(
+                    &buffer.0,
+                    map_index_format(index_format),
+                    offset as f64,
+                );
+            }
         };
-        self.0.set_index_buffer_with_f64_and_f64(
-            &buffer.0,
-            map_index_format(index_format),
-            offset as f64,
-            mapped_size,
-        );
     }
     fn set_vertex_buffer(
         &mut self,
@@ -310,12 +352,20 @@ impl crate::RenderInner<Context> for RenderBundleEncoder {
         offset: wgt::BufferAddress,
         size: Option<wgt::BufferSize>,
     ) {
-        let mapped_size = match size {
-            Some(s) => s.get() as f64,
-            None => 0f64,
+        match size {
+            Some(s) => {
+                self.0.set_vertex_buffer_with_f64_and_f64(
+                    slot,
+                    &buffer.0,
+                    offset as f64,
+                    s.get() as f64,
+                );
+            }
+            None => {
+                self.0
+                    .set_vertex_buffer_with_f64(slot, &buffer.0, offset as f64);
+            }
         };
-        self.0
-            .set_vertex_buffer_with_f64_and_f64(slot, &buffer.0, offset as f64, mapped_size);
     }
     fn set_push_constants(&mut self, _stages: wgt::ShaderStages, _offset: u32, _data: &[u8]) {
         panic!("PUSH_CONSTANTS feature must be enabled to call multi_draw_indexed_indirect")
@@ -445,7 +495,7 @@ impl crate::RenderPassInner<Context> for RenderPass {
     }
 
     fn write_timestamp(&mut self, _query_set: &(), _query_index: u32) {
-        // Not available in gecko yet
+        panic!("WRITE_TIMESTAMP_INSIDE_PASSES feature must be enabled to call write_timestamp in a compute pass")
     }
 
     fn begin_pipeline_statistics_query(&mut self, _query_set: &(), _query_index: u32) {
@@ -461,10 +511,12 @@ fn map_texture_format(texture_format: wgt::TextureFormat) -> web_sys::GpuTexture
     use web_sys::GpuTextureFormat as tf;
     use wgt::TextureFormat;
     match texture_format {
+        // 8-bit formats
         TextureFormat::R8Unorm => tf::R8unorm,
         TextureFormat::R8Snorm => tf::R8snorm,
         TextureFormat::R8Uint => tf::R8uint,
         TextureFormat::R8Sint => tf::R8sint,
+        // 16-bit formats
         TextureFormat::R16Uint => tf::R16uint,
         TextureFormat::R16Sint => tf::R16sint,
         TextureFormat::R16Float => tf::R16float,
@@ -472,6 +524,7 @@ fn map_texture_format(texture_format: wgt::TextureFormat) -> web_sys::GpuTexture
         TextureFormat::Rg8Snorm => tf::Rg8snorm,
         TextureFormat::Rg8Uint => tf::Rg8uint,
         TextureFormat::Rg8Sint => tf::Rg8sint,
+        // 32-bit formats
         TextureFormat::R32Uint => tf::R32uint,
         TextureFormat::R32Sint => tf::R32sint,
         TextureFormat::R32Float => tf::R32float,
@@ -485,68 +538,29 @@ fn map_texture_format(texture_format: wgt::TextureFormat) -> web_sys::GpuTexture
         TextureFormat::Rgba8Sint => tf::Rgba8sint,
         TextureFormat::Bgra8Unorm => tf::Bgra8unorm,
         TextureFormat::Bgra8UnormSrgb => tf::Bgra8unormSrgb,
+        // Packed 32-bit formats
+        TextureFormat::Rgb9e5Ufloat => tf::Rgb9e5ufloat,
         TextureFormat::Rgb10a2Unorm => tf::Rgb10a2unorm,
         TextureFormat::Rg11b10Float => tf::Rg11b10ufloat,
+        // 64-bit formats
         TextureFormat::Rg32Uint => tf::Rg32uint,
         TextureFormat::Rg32Sint => tf::Rg32sint,
         TextureFormat::Rg32Float => tf::Rg32float,
         TextureFormat::Rgba16Uint => tf::Rgba16uint,
         TextureFormat::Rgba16Sint => tf::Rgba16sint,
         TextureFormat::Rgba16Float => tf::Rgba16float,
+        // 128-bit formats
         TextureFormat::Rgba32Uint => tf::Rgba32uint,
         TextureFormat::Rgba32Sint => tf::Rgba32sint,
         TextureFormat::Rgba32Float => tf::Rgba32float,
-        TextureFormat::Depth32Float => tf::Depth32float,
+        // Depth/stencil formats
+        //TextureFormat::Stencil8 => tf::Stencil8,
+        TextureFormat::Depth16Unorm => tf::Depth16unorm,
         TextureFormat::Depth24Plus => tf::Depth24plus,
         TextureFormat::Depth24PlusStencil8 => tf::Depth24plusStencil8,
-        _ => unimplemented!(),
-    }
-}
-
-fn map_texture_format_from_web_sys(
-    texture_format: web_sys::GpuTextureFormat,
-) -> wgt::TextureFormat {
-    use web_sys::GpuTextureFormat as tf;
-    use wgt::TextureFormat;
-    match texture_format {
-        tf::R8unorm => TextureFormat::R8Unorm,
-        tf::R8snorm => TextureFormat::R8Snorm,
-        tf::R8uint => TextureFormat::R8Uint,
-        tf::R8sint => TextureFormat::R8Sint,
-        tf::R16uint => TextureFormat::R16Uint,
-        tf::R16sint => TextureFormat::R16Sint,
-        tf::R16float => TextureFormat::R16Float,
-        tf::Rg8unorm => TextureFormat::Rg8Unorm,
-        tf::Rg8snorm => TextureFormat::Rg8Snorm,
-        tf::Rg8uint => TextureFormat::Rg8Uint,
-        tf::Rg8sint => TextureFormat::Rg8Sint,
-        tf::R32uint => TextureFormat::R32Uint,
-        tf::R32sint => TextureFormat::R32Sint,
-        tf::R32float => TextureFormat::R32Float,
-        tf::Rg16uint => TextureFormat::Rg16Uint,
-        tf::Rg16sint => TextureFormat::Rg16Sint,
-        tf::Rg16float => TextureFormat::Rg16Float,
-        tf::Rgba8unorm => TextureFormat::Rgba8Unorm,
-        tf::Rgba8unormSrgb => TextureFormat::Rgba8UnormSrgb,
-        tf::Rgba8snorm => TextureFormat::Rgba8Snorm,
-        tf::Rgba8uint => TextureFormat::Rgba8Uint,
-        tf::Rgba8sint => TextureFormat::Rgba8Sint,
-        tf::Bgra8unorm => TextureFormat::Bgra8Unorm,
-        tf::Bgra8unormSrgb => TextureFormat::Bgra8UnormSrgb,
-        tf::Rgb10a2unorm => TextureFormat::Rgb10a2Unorm,
-        tf::Rg11b10ufloat => TextureFormat::Rg11b10Float,
-        tf::Rg32uint => TextureFormat::Rg32Uint,
-        tf::Rg32sint => TextureFormat::Rg32Sint,
-        tf::Rg32float => TextureFormat::Rg32Float,
-        tf::Rgba16uint => TextureFormat::Rgba16Uint,
-        tf::Rgba16sint => TextureFormat::Rgba16Sint,
-        tf::Rgba16float => TextureFormat::Rgba16Float,
-        tf::Rgba32uint => TextureFormat::Rgba32Uint,
-        tf::Rgba32sint => TextureFormat::Rgba32Sint,
-        tf::Rgba32float => TextureFormat::Rgba32Float,
-        tf::Depth32float => TextureFormat::Depth32Float,
-        tf::Depth24plus => TextureFormat::Depth24Plus,
-        tf::Depth24plusStencil8 => TextureFormat::Depth24PlusStencil8,
+        TextureFormat::Depth32Float => tf::Depth32float,
+        // "depth32float-stencil8" feature
+        TextureFormat::Depth32FloatStencil8 => tf::Depth32floatStencil8,
         _ => unimplemented!(),
     }
 }
@@ -604,7 +618,8 @@ fn map_primitive_state(primitive: &wgt::PrimitiveState) -> web_sys::GpuPrimitive
         PrimitiveTopology::TriangleStrip => pt::TriangleStrip,
     });
 
-    //mapped.clamp_depth(primitive.clamp_depth);
+    //TODO:
+    //mapped.unclipped_depth(primitive.unclipped_depth);
 
     mapped
 }
@@ -819,6 +834,15 @@ fn map_texture_copy_view(view: crate::ImageCopyTexture) -> web_sys::GpuImageCopy
     mapped
 }
 
+fn map_tagged_texture_copy_view(
+    view: crate::ImageCopyTexture,
+) -> web_sys::GpuImageCopyTextureTagged {
+    let mut mapped = web_sys::GpuImageCopyTextureTagged::new(&view.texture.id.0);
+    mapped.mip_level(view.mip_level);
+    mapped.origin(&map_origin_3d(view.origin));
+    mapped
+}
+
 fn map_texture_aspect(aspect: wgt::TextureAspect) -> web_sys::GpuTextureAspect {
     match aspect {
         wgt::TextureAspect::All => web_sys::GpuTextureAspect::All,
@@ -831,6 +855,13 @@ fn map_filter_mode(mode: wgt::FilterMode) -> web_sys::GpuFilterMode {
     match mode {
         wgt::FilterMode::Nearest => web_sys::GpuFilterMode::Nearest,
         wgt::FilterMode::Linear => web_sys::GpuFilterMode::Linear,
+    }
+}
+
+fn map_mipmap_filter_mode(mode: wgt::FilterMode) -> web_sys::GpuMipmapFilterMode {
+    match mode {
+        wgt::FilterMode::Nearest => web_sys::GpuMipmapFilterMode::Nearest,
+        wgt::FilterMode::Linear => web_sys::GpuMipmapFilterMode::Linear,
     }
 }
 
@@ -857,19 +888,20 @@ fn map_store_op(store: bool) -> web_sys::GpuStoreOp {
 
 fn map_map_mode(mode: crate::MapMode) -> u32 {
     match mode {
-        crate::MapMode::Read => web_sys::GpuMapMode::READ,
-        crate::MapMode::Write => web_sys::GpuMapMode::WRITE,
+        crate::MapMode::Read => web_sys::gpu_map_mode::READ,
+        crate::MapMode::Write => web_sys::gpu_map_mode::WRITE,
     }
 }
 
 type JsFutureResult = Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
 
 fn future_request_adapter(result: JsFutureResult) -> Option<Sendable<web_sys::GpuAdapter>> {
-    match result {
-        Ok(js_value) => Some(Sendable(web_sys::GpuAdapter::from(js_value))),
+    match result.and_then(wasm_bindgen::JsCast::dyn_into) {
+        Ok(adapter) => Some(Sendable(adapter)),
         Err(_) => None,
     }
 }
+
 fn future_request_device(
     result: JsFutureResult,
 ) -> Result<(Sendable<web_sys::GpuDevice>, Sendable<web_sys::GpuQueue>), crate::RequestDeviceError>
@@ -883,9 +915,118 @@ fn future_request_device(
         .map_err(|_| crate::RequestDeviceError)
 }
 
-fn future_map_async(result: JsFutureResult) -> Result<(), crate::BufferAsyncError> {
-    result.map(|_| ()).map_err(|_| crate::BufferAsyncError)
+fn future_pop_error_scope(result: JsFutureResult) -> Option<crate::Error> {
+    match result {
+        Ok(js_value) if js_value.is_object() => {
+            let js_error = wasm_bindgen::JsCast::dyn_into(js_value).unwrap();
+            Some(crate::Error::from_js(js_error))
+        }
+        _ => None,
+    }
 }
+
+/// Calls `callback(success_value)` when the promise completes successfully, calls `callback(failure_value)`
+/// when the promise completes unsuccessfully.
+fn register_then_closures<F, T>(promise: &Promise, callback: F, success_value: T, failure_value: T)
+where
+    F: FnOnce(T) + 'static,
+    T: 'static,
+{
+    // Both the 'success' and 'rejected' closures need access to callback, but only one
+    // of them will ever run. We have them both hold a reference to a `Rc<RefCell<Option<impl FnOnce...>>>`,
+    // and then take ownership of callback when invoked.
+    //
+    // We also only need Rc's because these will only ever be called on our thread.
+    //
+    // We also store the actual closure types inside this Rc, as the closures need to be kept alive
+    // until they are actually called by the callback. It is valid to drop a closure inside of a callback.
+    // This allows us to keep the closures alive without leaking them.
+    let rc_callback: Rc<RefCell<Option<(_, _, F)>>> = Rc::new(RefCell::new(None));
+
+    let rc_callback_clone1 = rc_callback.clone();
+    let rc_callback_clone2 = rc_callback.clone();
+    let closure_success = wasm_bindgen::closure::Closure::once(move |_| {
+        let (success_closure, rejection_closure, callback) =
+            rc_callback_clone1.borrow_mut().take().unwrap();
+        callback(success_value);
+        // drop the closures, including ourselves, which will free any captured memory.
+        drop((success_closure, rejection_closure));
+    });
+    let closure_rejected = wasm_bindgen::closure::Closure::once(move |_| {
+        let (success_closure, rejection_closure, callback) =
+            rc_callback_clone2.borrow_mut().take().unwrap();
+        callback(failure_value);
+        // drop the closures, including ourselves, which will free any captured memory.
+        drop((success_closure, rejection_closure));
+    });
+
+    // Calling then before setting the value in the Rc seems like a race, but it isn't
+    // because the promise callback will run on this thread, so there is no race.
+    let _ = promise.then2(&closure_success, &closure_rejected);
+
+    *rc_callback.borrow_mut() = Some((closure_success, closure_rejected, callback));
+}
+
+impl Context {
+    pub fn instance_create_surface_from_canvas(
+        &self,
+        canvas: &web_sys::HtmlCanvasElement,
+    ) -> <Self as crate::Context>::SurfaceId {
+        let context: wasm_bindgen::JsValue = match canvas.get_context("webgpu") {
+            Ok(Some(ctx)) => ctx.into(),
+            _ => panic!("expected to get context from canvas"),
+        };
+        Sendable(context.into())
+    }
+
+    pub fn instance_create_surface_from_offscreen_canvas(
+        &self,
+        canvas: &web_sys::OffscreenCanvas,
+    ) -> <Self as crate::Context>::SurfaceId {
+        let context: wasm_bindgen::JsValue = match canvas.get_context("webgpu") {
+            Ok(Some(ctx)) => ctx.into(),
+            _ => panic!("expected to get context from canvas"),
+        };
+        Sendable(context.into())
+    }
+
+    pub fn queue_copy_external_image_to_texture(
+        &self,
+        queue: &Sendable<web_sys::GpuQueue>,
+        image: &web_sys::ImageBitmap,
+        texture: crate::ImageCopyTexture,
+        size: wgt::Extent3d,
+    ) {
+        queue
+            .0
+            .copy_external_image_to_texture_with_gpu_extent_3d_dict(
+                &web_sys::GpuImageCopyExternalImage::new(image),
+                &map_tagged_texture_copy_view(texture),
+                &map_extent_3d(size),
+            );
+    }
+}
+
+// Represents the global object in the JavaScript context.
+// It can be cast to from `web_sys::global` and exposes two getters `window` and `worker` of which only one is defined depending on the caller's context.
+// When called from the UI thread only `window` is defined whereas `worker` is only defined within a web worker context.
+// See: https://github.com/rustwasm/gloo/blob/2c9e776701ecb90c53e62dec1abd19c2b70e47c7/crates/timers/src/callback.rs#L8-L40
+#[wasm_bindgen]
+extern "C" {
+    type Global;
+
+    #[wasm_bindgen(method, getter, js_name = Window)]
+    fn window(this: &Global) -> JsValue;
+
+    #[wasm_bindgen(method, getter, js_name = WorkerGlobalScope)]
+    fn worker(this: &Global) -> JsValue;
+}
+
+// The web doesn't provide any way to identify specific queue
+// submissions. But Clippy gets concerned if we pass around `()` as if
+// it were meaningful.
+#[derive(Debug, Clone, Copy)]
+pub struct SubmissionIndex;
 
 impl crate::Context for Context {
     type AdapterId = Sendable<web_sys::GpuAdapter>;
@@ -902,7 +1043,7 @@ impl crate::Context for Context {
     type PipelineLayoutId = Sendable<web_sys::GpuPipelineLayout>;
     type RenderPipelineId = Sendable<web_sys::GpuRenderPipeline>;
     type ComputePipelineId = Sendable<web_sys::GpuComputePipeline>;
-    type CommandEncoderId = web_sys::GpuCommandEncoder;
+    type CommandEncoderId = Sendable<web_sys::GpuCommandEncoder>;
     type ComputePassId = ComputePass;
     type RenderPassId = RenderPass;
     type CommandBufferId = Sendable<web_sys::GpuCommandBuffer>;
@@ -911,6 +1052,7 @@ impl crate::Context for Context {
     type SurfaceId = Sendable<web_sys::GpuCanvasContext>;
 
     type SurfaceOutputDetail = SurfaceOutputDetail;
+    type SubmissionIndex = SubmissionIndex;
 
     type RequestAdapterFuture = MakeSendFuture<
         wasm_bindgen_futures::JsFuture,
@@ -920,22 +1062,32 @@ impl crate::Context for Context {
         wasm_bindgen_futures::JsFuture,
         fn(JsFutureResult) -> Result<(Self::DeviceId, Self::QueueId), crate::RequestDeviceError>,
     >;
-    type MapAsyncFuture = MakeSendFuture<
-        wasm_bindgen_futures::JsFuture,
-        fn(JsFutureResult) -> Result<(), crate::BufferAsyncError>,
-    >;
-    type OnSubmittedWorkDoneFuture =
-        MakeSendFuture<wasm_bindgen_futures::JsFuture, fn(JsFutureResult) -> ()>;
+    type PopErrorScopeFuture =
+        MakeSendFuture<wasm_bindgen_futures::JsFuture, fn(JsFutureResult) -> Option<crate::Error>>;
 
     fn init(_backends: wgt::Backends) -> Self {
-        Context(web_sys::window().unwrap().navigator().gpu())
+        let global: Global = js_sys::global().unchecked_into();
+        let gpu = if !global.window().is_undefined() {
+            global.unchecked_into::<web_sys::Window>().navigator().gpu()
+        } else if !global.worker().is_undefined() {
+            global
+                .unchecked_into::<web_sys::WorkerGlobalScope>()
+                .navigator()
+                .gpu()
+        } else {
+            panic!(
+                "Accessing the GPU is only supported on the main thread or from a dedicated worker"
+            );
+        };
+        Context(gpu)
     }
 
     fn instance_create_surface(
         &self,
-        handle: &impl raw_window_handle::HasRawWindowHandle,
+        _display_handle: raw_window_handle::RawDisplayHandle,
+        window_handle: raw_window_handle::RawWindowHandle,
     ) -> Self::SurfaceId {
-        let canvas_attribute = match handle.raw_window_handle() {
+        let canvas_attribute = match window_handle {
             raw_window_handle::RawWindowHandle::Web(web_handle) => web_handle.id,
             _ => panic!("expected valid handle for canvas"),
         };
@@ -949,11 +1101,7 @@ impl crate::Context for Context {
             .expect("expected to find single canvas")
             .into();
         let canvas_element: web_sys::HtmlCanvasElement = canvas_node.into();
-        let context: wasm_bindgen::JsValue = match canvas_element.get_context("gpupresent") {
-            Ok(Some(ctx)) => ctx.into(),
-            _ => panic!("expected to get context from canvas"),
-        };
-        Sendable(context.into())
+        self.instance_create_surface_from_canvas(&canvas_element)
     }
 
     fn adapter_is_surface_supported(
@@ -986,8 +1134,9 @@ impl crate::Context for Context {
         )
     }
 
-    fn instance_poll_all_devices(&self, _force_wait: bool) {
+    fn instance_poll_all_devices(&self, _force_wait: bool) -> bool {
         // Devices are automatically polled.
+        true
     }
 
     fn adapter_request_device(
@@ -1006,18 +1155,30 @@ impl crate::Context for Context {
         let mut mapped_desc = web_sys::GpuDeviceDescriptor::new();
 
         let possible_features = [
-            (wgt::Features::DEPTH_CLAMPING, Gfn::DepthClamping),
-            // TODO (_, Gfn::Depth24unormStencil8),
-            // TODO (_, Gfn::Depth32floatStencil8),
+            //TODO: update the name
+            (wgt::Features::DEPTH_CLIP_CONTROL, Gfn::DepthClipControl),
             (
-                wgt::Features::PIPELINE_STATISTICS_QUERY,
-                Gfn::PipelineStatisticsQuery,
+                wgt::Features::DEPTH32FLOAT_STENCIL8,
+                Gfn::Depth32floatStencil8,
             ),
             (
                 wgt::Features::TEXTURE_COMPRESSION_BC,
                 Gfn::TextureCompressionBc,
             ),
+            (
+                wgt::Features::TEXTURE_COMPRESSION_ETC2,
+                Gfn::TextureCompressionEtc2,
+            ),
+            (
+                wgt::Features::TEXTURE_COMPRESSION_ASTC_LDR,
+                Gfn::TextureCompressionAstc,
+            ),
             (wgt::Features::TIMESTAMP_QUERY, Gfn::TimestampQuery),
+            (
+                wgt::Features::INDIRECT_FIRST_INSTANCE,
+                Gfn::IndirectFirstInstance,
+            ),
+            (wgt::Features::SHADER_FLOAT16, Gfn::ShaderF16),
         ];
         let required_features = possible_features
             .iter()
@@ -1058,6 +1219,7 @@ impl crate::Context for Context {
             max_texture_dimension_3d: limits.max_texture_dimension_3d(),
             max_texture_array_layers: limits.max_texture_array_layers(),
             max_bind_groups: limits.max_bind_groups(),
+            max_bindings_per_bind_group: limits.max_bindings_per_bind_group(),
             max_dynamic_uniform_buffers_per_pipeline_layout: limits
                 .max_dynamic_uniform_buffers_per_pipeline_layout(),
             max_dynamic_storage_buffers_per_pipeline_layout: limits
@@ -1076,7 +1238,7 @@ impl crate::Context for Context {
         }
     }
 
-    fn adapter_downlevel_properties(
+    fn adapter_downlevel_capabilities(
         &self,
         _adapter: &Self::AdapterId,
     ) -> wgt::DownlevelCapabilities {
@@ -1091,6 +1253,8 @@ impl crate::Context for Context {
             vendor: 0,
             device: 0,
             device_type: wgt::DeviceType::Other,
+            driver: String::new(),
+            driver_info: String::new(),
             backend: wgt::Backend::BrowserWebGpu,
         }
     }
@@ -1103,13 +1267,33 @@ impl crate::Context for Context {
         format.describe().guaranteed_format_features
     }
 
-    fn surface_get_preferred_format(
+    fn surface_get_supported_formats(
         &self,
-        surface: &Self::SurfaceId,
-        adapter: &Self::AdapterId,
-    ) -> Option<wgt::TextureFormat> {
-        let format = map_texture_format_from_web_sys(surface.0.get_preferred_format(&adapter.0));
-        Some(format)
+        _surface: &Self::SurfaceId,
+        _adapter: &Self::AdapterId,
+    ) -> Vec<wgt::TextureFormat> {
+        // https://gpuweb.github.io/gpuweb/#supported-context-formats
+        vec![
+            wgt::TextureFormat::Bgra8Unorm,
+            wgt::TextureFormat::Rgba8Unorm,
+            wgt::TextureFormat::Rgba16Float,
+        ]
+    }
+
+    fn surface_get_supported_present_modes(
+        &self,
+        _surface: &Self::SurfaceId,
+        _adapter: &Self::AdapterId,
+    ) -> Vec<wgt::PresentMode> {
+        vec![wgt::PresentMode::Fifo]
+    }
+
+    fn surface_get_supported_alpha_modes(
+        &self,
+        _surface: &Self::SurfaceId,
+        _adapter: &Self::AdapterId,
+    ) -> Vec<wgt::CompositeAlphaMode> {
+        vec![wgt::CompositeAlphaMode::Opaque]
     }
 
     fn surface_configure(
@@ -1118,9 +1302,22 @@ impl crate::Context for Context {
         device: &Self::DeviceId,
         config: &wgt::SurfaceConfiguration,
     ) {
+        if let wgt::PresentMode::Mailbox | wgt::PresentMode::Immediate = config.present_mode {
+            panic!("Only FIFO/Auto* is supported on web");
+        }
+        if let wgt::CompositeAlphaMode::PostMultiplied | wgt::CompositeAlphaMode::Inherit =
+            config.alpha_mode
+        {
+            panic!("Only Opaque/Auto or PreMultiplied alpha mode are supported on web");
+        }
+        let alpha_mode = match config.alpha_mode {
+            wgt::CompositeAlphaMode::PreMultiplied => web_sys::GpuCanvasAlphaMode::Premultiplied,
+            _ => web_sys::GpuCanvasAlphaMode::Opaque,
+        };
         let mut mapped =
             web_sys::GpuCanvasConfiguration::new(&device.0, map_texture_format(config.format));
         mapped.usage(config.usage.bits());
+        mapped.alpha_mode(alpha_mode);
         surface.0.configure(&mapped);
     }
 
@@ -1143,6 +1340,14 @@ impl crate::Context for Context {
         // Swapchain is presented automatically
     }
 
+    fn surface_texture_discard(
+        &self,
+        _texture: &Self::TextureId,
+        _detail: &Self::SurfaceOutputDetail,
+    ) {
+        // Can't really discard this on the Web
+    }
+
     fn device_features(&self, _device: &Self::DeviceId) -> wgt::Features {
         // TODO
         wgt::Features::empty()
@@ -1158,20 +1363,30 @@ impl crate::Context for Context {
         wgt::DownlevelCapabilities::default()
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "spirv",
+            feature = "glsl",
+            feature = "wgsl",
+            feature = "naga"
+        )),
+        allow(unreachable_code, unused_variables)
+    )]
     fn device_create_shader_module(
         &self,
         device: &Self::DeviceId,
-        desc: &crate::ShaderModuleDescriptor,
+        desc: crate::ShaderModuleDescriptor,
+        _shader_bound_checks: wgt::ShaderBoundChecks,
     ) -> Self::ShaderModuleId {
-        let mut descriptor = match desc.source {
-            #[cfg(feature = "spirv-web")]
+        let mut descriptor: web_sys::GpuShaderModuleDescriptor = match desc.source {
+            #[cfg(feature = "spirv")]
             crate::ShaderSource::SpirV(ref spv) => {
                 use naga::{back, front, valid};
 
                 let options = naga::front::spv::Options {
                     adjust_coordinate_space: false,
                     strict_capabilities: true,
-                    flow_graph_dump_prefix: None,
+                    block_ctx_dump_prefix: None,
                 };
                 let spv_parser = front::spv::Parser::new(spv.iter().cloned(), &options);
                 let spv_module = spv_parser.parse().unwrap();
@@ -1182,10 +1397,59 @@ impl crate::Context for Context {
                 );
                 let spv_module_info = validator.validate(&spv_module).unwrap();
 
-                let wgsl_text = back::wgsl::write_string(&spv_module, &spv_module_info).unwrap();
+                let writer_flags = naga::back::wgsl::WriterFlags::empty();
+                let wgsl_text =
+                    back::wgsl::write_string(&spv_module, &spv_module_info, writer_flags).unwrap();
                 web_sys::GpuShaderModuleDescriptor::new(wgsl_text.as_str())
             }
+            #[cfg(feature = "glsl")]
+            crate::ShaderSource::Glsl {
+                ref shader,
+                stage,
+                ref defines,
+            } => {
+                use naga::{back, front, valid};
+
+                // Parse the given shader code and store its representation.
+                let options = front::glsl::Options {
+                    stage,
+                    defines: defines.clone(),
+                };
+                let mut parser = front::glsl::Parser::default();
+                let glsl_module = parser.parse(&options, shader).unwrap();
+
+                let mut validator = valid::Validator::new(
+                    valid::ValidationFlags::all(),
+                    valid::Capabilities::all(),
+                );
+                let glsl_module_info = validator.validate(&glsl_module).unwrap();
+
+                let writer_flags = naga::back::wgsl::WriterFlags::empty();
+                let wgsl_text =
+                    back::wgsl::write_string(&glsl_module, &glsl_module_info, writer_flags)
+                        .unwrap();
+                web_sys::GpuShaderModuleDescriptor::new(wgsl_text.as_str())
+            }
+            #[cfg(feature = "wgsl")]
             crate::ShaderSource::Wgsl(ref code) => web_sys::GpuShaderModuleDescriptor::new(code),
+            #[cfg(feature = "naga")]
+            crate::ShaderSource::Naga(module) => {
+                use naga::{back, valid};
+
+                let mut validator = valid::Validator::new(
+                    valid::ValidationFlags::all(),
+                    valid::Capabilities::all(),
+                );
+                let module_info = validator.validate(&module).unwrap();
+
+                let writer_flags = naga::back::wgsl::WriterFlags::empty();
+                let wgsl_text =
+                    back::wgsl::write_string(&module, &module_info, writer_flags).unwrap();
+                web_sys::GpuShaderModuleDescriptor::new(wgsl_text.as_str())
+            }
+            crate::ShaderSource::Dummy(_) => {
+                panic!("found `ShaderSource::Dummy`")
+            }
         };
         if let Some(label) = desc.label {
             descriptor.label(label);
@@ -1229,15 +1493,18 @@ impl crate::Context for Context {
                         });
                         mapped_entry.buffer(&buffer);
                     }
-                    wgt::BindingType::Sampler {
-                        comparison,
-                        filtering,
-                    } => {
+                    wgt::BindingType::Sampler(ty) => {
                         let mut sampler = web_sys::GpuSamplerBindingLayout::new();
-                        sampler.type_(match (comparison, filtering) {
-                            (false, false) => web_sys::GpuSamplerBindingType::NonFiltering,
-                            (false, true) => web_sys::GpuSamplerBindingType::Filtering,
-                            (true, _) => web_sys::GpuSamplerBindingType::Comparison,
+                        sampler.type_(match ty {
+                            wgt::SamplerBindingType::NonFiltering => {
+                                web_sys::GpuSamplerBindingType::NonFiltering
+                            }
+                            wgt::SamplerBindingType::Filtering => {
+                                web_sys::GpuSamplerBindingType::Filtering
+                            }
+                            wgt::SamplerBindingType::Comparison => {
+                                web_sys::GpuSamplerBindingType::Comparison
+                            }
                         });
                         mapped_entry.sampler(&sampler);
                     }
@@ -1323,6 +1590,9 @@ impl crate::Context for Context {
                         panic!("Web backend does not support arrays of buffers")
                     }
                     crate::BindingResource::Sampler(sampler) => JsValue::from(sampler.id.0.clone()),
+                    crate::BindingResource::SamplerArray(..) => {
+                        panic!("Web backend does not support arrays of samplers")
+                    }
                     crate::BindingResource::TextureView(texture_view) => {
                         JsValue::from(texture_view.id.0.clone())
                     }
@@ -1396,14 +1666,17 @@ impl crate::Context for Context {
 
         mapped_vertex_state.buffers(&buffers);
 
-        let mut mapped_desc = web_sys::GpuRenderPipelineDescriptor::new(&mapped_vertex_state);
+        let auto_layout = wasm_bindgen::JsValue::from(web_sys::GpuAutoLayoutMode::Auto);
+        let mut mapped_desc = web_sys::GpuRenderPipelineDescriptor::new(
+            match desc.layout {
+                Some(layout) => &layout.id.0,
+                None => &auto_layout,
+            },
+            &mapped_vertex_state,
+        );
 
         if let Some(label) = desc.label {
             mapped_desc.label(label);
-        }
-
-        if let Some(layout) = desc.layout {
-            mapped_desc.layout(&layout.id.0);
         }
 
         if let Some(ref depth_stencil) = desc.depth_stencil {
@@ -1414,17 +1687,21 @@ impl crate::Context for Context {
             let targets = frag
                 .targets
                 .iter()
-                .map(|target| {
-                    let mapped_format = map_texture_format(target.format);
-                    let mut mapped_color_state = web_sys::GpuColorTargetState::new(mapped_format);
-                    if let Some(ref bs) = target.blend {
-                        let alpha = map_blend_component(&bs.alpha);
-                        let color = map_blend_component(&bs.color);
-                        let mapped_blend_state = web_sys::GpuBlendState::new(&alpha, &color);
-                        mapped_color_state.blend(&mapped_blend_state);
+                .map(|target| match target {
+                    Some(target) => {
+                        let mapped_format = map_texture_format(target.format);
+                        let mut mapped_color_state =
+                            web_sys::GpuColorTargetState::new(mapped_format);
+                        if let Some(ref bs) = target.blend {
+                            let alpha = map_blend_component(&bs.alpha);
+                            let color = map_blend_component(&bs.color);
+                            let mapped_blend_state = web_sys::GpuBlendState::new(&alpha, &color);
+                            mapped_color_state.blend(&mapped_blend_state);
+                        }
+                        mapped_color_state.write_mask(target.write_mask.bits());
+                        wasm_bindgen::JsValue::from(mapped_color_state)
                     }
-                    mapped_color_state.write_mask(target.write_mask.bits());
-                    mapped_color_state
+                    None => wasm_bindgen::JsValue::null(),
                 })
                 .collect::<js_sys::Array>();
             let mapped_fragment_desc =
@@ -1451,10 +1728,14 @@ impl crate::Context for Context {
     ) -> Self::ComputePipelineId {
         let mapped_compute_stage =
             web_sys::GpuProgrammableStage::new(desc.entry_point, &desc.module.id.0);
-        let mut mapped_desc = web_sys::GpuComputePipelineDescriptor::new(&mapped_compute_stage);
-        if let Some(layout) = desc.layout {
-            mapped_desc.layout(&layout.id.0);
-        }
+        let auto_layout = wasm_bindgen::JsValue::from(web_sys::GpuAutoLayoutMode::Auto);
+        let mut mapped_desc = web_sys::GpuComputePipelineDescriptor::new(
+            match desc.layout {
+                Some(layout) => &layout.id.0,
+                None => &auto_layout,
+            },
+            &mapped_compute_stage,
+        );
         if let Some(label) = desc.label {
             mapped_desc.label(label);
         }
@@ -1510,7 +1791,7 @@ impl crate::Context for Context {
         mapped_desc.lod_min_clamp(desc.lod_min_clamp);
         mapped_desc.mag_filter(map_filter_mode(desc.mag_filter));
         mapped_desc.min_filter(map_filter_mode(desc.min_filter));
-        mapped_desc.mipmap_filter(map_filter_mode(desc.mipmap_filter));
+        mapped_desc.mipmap_filter(map_mipmap_filter_mode(desc.mipmap_filter));
         // TODO: `max_anisotropy` is not available on `desc` yet
         // mapped_desc.max_anisotropy(desc.max_anisotropy);
         if let Some(label) = desc.label {
@@ -1535,9 +1816,11 @@ impl crate::Context for Context {
         if let Some(label) = desc.label {
             mapped_desc.label(label);
         }
-        device
-            .0
-            .create_command_encoder_with_descriptor(&mapped_desc)
+        Sendable(
+            device
+                .0
+                .create_command_encoder_with_descriptor(&mapped_desc),
+        )
     }
 
     fn device_create_render_bundle_encoder(
@@ -1548,7 +1831,10 @@ impl crate::Context for Context {
         let mapped_color_formats = desc
             .color_formats
             .iter()
-            .map(|cf| wasm_bindgen::JsValue::from(map_texture_format(*cf)))
+            .map(|cf| match cf {
+                Some(cf) => wasm_bindgen::JsValue::from(map_texture_format(*cf)),
+                None => wasm_bindgen::JsValue::null(),
+            })
             .collect::<js_sys::Array>();
         let mut mapped_desc = web_sys::GpuRenderBundleEncoderDescriptor::new(&mapped_color_formats);
         if let Some(label) = desc.label {
@@ -1565,34 +1851,58 @@ impl crate::Context for Context {
         // Device is dropped automatically
     }
 
-    fn device_poll(&self, _device: &Self::DeviceId, _maintain: crate::Maintain) {
+    fn device_poll(&self, _device: &Self::DeviceId, _maintain: crate::Maintain) -> bool {
         // Device is polled automatically
+        true
     }
 
     fn device_on_uncaptured_error(
         &self,
-        _device: &Self::DeviceId,
-        _handler: impl crate::UncapturedErrorHandler,
+        device: &Self::DeviceId,
+        handler: impl crate::UncapturedErrorHandler,
     ) {
-        // TODO:
+        let f = Closure::wrap(Box::new(move |event: web_sys::GpuUncapturedErrorEvent| {
+            let error = crate::Error::from_js(event.error().value_of());
+            handler(error);
+        }) as Box<dyn FnMut(_)>);
+        device
+            .0
+            .set_onuncapturederror(Some(f.as_ref().unchecked_ref()));
+        // TODO: This will leak the memory associated with the error handler by default.
+        f.forget();
     }
 
-    fn buffer_map_async(
+    fn device_push_error_scope(&self, device: &Self::DeviceId, filter: crate::ErrorFilter) {
+        device.0.push_error_scope(match filter {
+            crate::ErrorFilter::OutOfMemory => web_sys::GpuErrorFilter::OutOfMemory,
+            crate::ErrorFilter::Validation => web_sys::GpuErrorFilter::Validation,
+        });
+    }
+
+    fn device_pop_error_scope(&self, device: &Self::DeviceId) -> Self::PopErrorScopeFuture {
+        let error_promise = device.0.pop_error_scope();
+        MakeSendFuture::new(
+            wasm_bindgen_futures::JsFuture::from(error_promise),
+            future_pop_error_scope,
+        )
+    }
+
+    fn buffer_map_async<F>(
         &self,
         buffer: &Self::BufferId,
         mode: crate::MapMode,
         range: Range<wgt::BufferAddress>,
-    ) -> Self::MapAsyncFuture {
+        callback: F,
+    ) where
+        F: FnOnce(Result<(), crate::BufferAsyncError>) + Send + 'static,
+    {
         let map_promise = buffer.0.map_async_with_f64_and_f64(
             map_map_mode(mode),
             range.start as f64,
             (range.end - range.start) as f64,
         );
 
-        MakeSendFuture::new(
-            wasm_bindgen_futures::JsFuture::from(map_promise),
-            future_map_async,
-        )
+        register_then_closures(&map_promise, callback, Ok(()), Err(crate::BufferAsyncError));
     }
 
     fn buffer_get_mapped_range(
@@ -1740,7 +2050,7 @@ impl crate::Context for Context {
         destination_offset: wgt::BufferAddress,
         copy_size: wgt::BufferAddress,
     ) {
-        encoder.copy_buffer_to_buffer_with_f64_and_f64_and_f64(
+        encoder.0.copy_buffer_to_buffer_with_f64_and_f64_and_f64(
             &source.0,
             source_offset as f64,
             &destination.0,
@@ -1756,7 +2066,7 @@ impl crate::Context for Context {
         destination: crate::ImageCopyTexture,
         copy_size: wgt::Extent3d,
     ) {
-        encoder.copy_buffer_to_texture_with_gpu_extent_3d_dict(
+        encoder.0.copy_buffer_to_texture_with_gpu_extent_3d_dict(
             &map_buffer_copy_view(source),
             &map_texture_copy_view(destination),
             &map_extent_3d(copy_size),
@@ -1770,7 +2080,7 @@ impl crate::Context for Context {
         destination: crate::ImageCopyBuffer,
         copy_size: wgt::Extent3d,
     ) {
-        encoder.copy_texture_to_buffer_with_gpu_extent_3d_dict(
+        encoder.0.copy_texture_to_buffer_with_gpu_extent_3d_dict(
             &map_texture_copy_view(source),
             &map_buffer_copy_view(destination),
             &map_extent_3d(copy_size),
@@ -1784,7 +2094,7 @@ impl crate::Context for Context {
         destination: crate::ImageCopyTexture,
         copy_size: wgt::Extent3d,
     ) {
-        encoder.copy_texture_to_texture_with_gpu_extent_3d_dict(
+        encoder.0.copy_texture_to_texture_with_gpu_extent_3d_dict(
             &map_texture_copy_view(source),
             &map_texture_copy_view(destination),
             &map_extent_3d(copy_size),
@@ -1800,7 +2110,7 @@ impl crate::Context for Context {
         if let Some(label) = desc.label {
             mapped_desc.label(label);
         }
-        ComputePass(encoder.begin_compute_pass_with_descriptor(&mapped_desc))
+        ComputePass(encoder.0.begin_compute_pass_with_descriptor(&mapped_desc))
     }
 
     fn command_encoder_end_compute_pass(
@@ -1808,7 +2118,7 @@ impl crate::Context for Context {
         _encoder: &Self::CommandEncoderId,
         pass: &mut Self::ComputePassId,
     ) {
-        pass.0.end_pass();
+        pass.0.end();
     }
 
     fn command_encoder_begin_render_pass<'a>(
@@ -1819,25 +2129,33 @@ impl crate::Context for Context {
         let mapped_color_attachments = desc
             .color_attachments
             .iter()
-            .map(|ca| {
-                let load_value = match ca.ops.load {
-                    crate::LoadOp::Clear(color) => wasm_bindgen::JsValue::from(map_color(color)),
-                    crate::LoadOp::Load => wasm_bindgen::JsValue::from(web_sys::GpuLoadOp::Load),
-                };
+            .map(|attachment| match attachment {
+                Some(ca) => {
+                    let mut clear_value: Option<wasm_bindgen::JsValue> = None;
+                    let load_value = match ca.ops.load {
+                        crate::LoadOp::Clear(color) => {
+                            clear_value = Some(wasm_bindgen::JsValue::from(map_color(color)));
+                            web_sys::GpuLoadOp::Clear
+                        }
+                        crate::LoadOp::Load => web_sys::GpuLoadOp::Load,
+                    };
 
-                let mut mapped_color_attachment = web_sys::GpuRenderPassColorAttachment::new(
-                    &load_value,
-                    map_store_op(ca.ops.store),
-                    &ca.view.id.0,
-                );
+                    let mut mapped_color_attachment = web_sys::GpuRenderPassColorAttachment::new(
+                        load_value,
+                        map_store_op(ca.ops.store),
+                        &ca.view.id.0,
+                    );
+                    if let Some(cv) = clear_value {
+                        mapped_color_attachment.clear_value(&cv);
+                    }
+                    if let Some(rt) = ca.resolve_target {
+                        mapped_color_attachment.resolve_target(&rt.id.0);
+                    }
+                    mapped_color_attachment.store_op(map_store_op(ca.ops.store));
 
-                if let Some(rt) = ca.resolve_target {
-                    mapped_color_attachment.resolve_target(&rt.id.0);
+                    wasm_bindgen::JsValue::from(mapped_color_attachment)
                 }
-
-                mapped_color_attachment.store_op(map_store_op(ca.ops.store));
-
-                mapped_color_attachment
+                None => wasm_bindgen::JsValue::null(),
             })
             .collect::<js_sys::Array>();
 
@@ -1848,48 +2166,46 @@ impl crate::Context for Context {
         }
 
         if let Some(dsa) = &desc.depth_stencil_attachment {
+            let mut depth_clear_value = 0.0;
+            let mut stencil_clear_value = 0;
             let (depth_load_op, depth_store_op) = match dsa.depth_ops {
                 Some(ref ops) => {
                     let load_op = match ops.load {
-                        crate::LoadOp::Clear(value) => wasm_bindgen::JsValue::from(value),
-                        crate::LoadOp::Load => {
-                            wasm_bindgen::JsValue::from(web_sys::GpuLoadOp::Load)
+                        crate::LoadOp::Clear(v) => {
+                            depth_clear_value = v;
+                            web_sys::GpuLoadOp::Clear
                         }
+                        crate::LoadOp::Load => web_sys::GpuLoadOp::Load,
                     };
                     (load_op, map_store_op(ops.store))
                 }
-                None => (
-                    wasm_bindgen::JsValue::from(web_sys::GpuLoadOp::Load),
-                    web_sys::GpuStoreOp::Store,
-                ),
+                None => (web_sys::GpuLoadOp::Load, web_sys::GpuStoreOp::Store),
             };
             let (stencil_load_op, stencil_store_op) = match dsa.stencil_ops {
                 Some(ref ops) => {
                     let load_op = match ops.load {
-                        crate::LoadOp::Clear(value) => wasm_bindgen::JsValue::from(value),
-                        crate::LoadOp::Load => {
-                            wasm_bindgen::JsValue::from(web_sys::GpuLoadOp::Load)
+                        crate::LoadOp::Clear(v) => {
+                            stencil_clear_value = v;
+                            web_sys::GpuLoadOp::Clear
                         }
+                        crate::LoadOp::Load => web_sys::GpuLoadOp::Load,
                     };
                     (load_op, map_store_op(ops.store))
                 }
-                None => (
-                    wasm_bindgen::JsValue::from(web_sys::GpuLoadOp::Load),
-                    web_sys::GpuStoreOp::Store,
-                ),
+                None => (web_sys::GpuLoadOp::Load, web_sys::GpuStoreOp::Store),
             };
-            let mapped_depth_stencil_attachment = web_sys::GpuRenderPassDepthStencilAttachment::new(
-                &depth_load_op,
-                depth_store_op,
-                &stencil_load_op,
-                stencil_store_op,
-                &dsa.view.id.0,
-            );
-
+            let mut mapped_depth_stencil_attachment =
+                web_sys::GpuRenderPassDepthStencilAttachment::new(&dsa.view.id.0);
+            mapped_depth_stencil_attachment.depth_clear_value(depth_clear_value);
+            mapped_depth_stencil_attachment.depth_load_op(depth_load_op);
+            mapped_depth_stencil_attachment.depth_store_op(depth_store_op);
+            mapped_depth_stencil_attachment.stencil_clear_value(stencil_clear_value);
+            mapped_depth_stencil_attachment.stencil_load_op(stencil_load_op);
+            mapped_depth_stencil_attachment.stencil_store_op(stencil_store_op);
             mapped_desc.depth_stencil_attachment(&mapped_depth_stencil_attachment);
         }
 
-        RenderPass(encoder.begin_render_pass(&mapped_desc))
+        RenderPass(encoder.0.begin_render_pass(&mapped_desc))
     }
 
     fn command_encoder_end_render_pass(
@@ -1897,26 +2213,27 @@ impl crate::Context for Context {
         _encoder: &Self::CommandEncoderId,
         pass: &mut Self::RenderPassId,
     ) {
-        pass.0.end_pass();
+        pass.0.end();
     }
 
     fn command_encoder_finish(&self, encoder: Self::CommandEncoderId) -> Self::CommandBufferId {
-        Sendable(match encoder.label() {
-            Some(ref label) => {
-                let mut mapped_desc = web_sys::GpuCommandBufferDescriptor::new();
-                mapped_desc.label(label);
-                encoder.finish_with_descriptor(&mapped_desc)
-            }
-            None => encoder.finish(),
+        let label = encoder.0.label();
+        Sendable(if label.is_empty() {
+            encoder.0.finish()
+        } else {
+            let mut mapped_desc = web_sys::GpuCommandBufferDescriptor::new();
+            mapped_desc.label(&label);
+            encoder.0.finish_with_descriptor(&mapped_desc)
         })
     }
 
-    fn command_encoder_clear_image(
+    fn command_encoder_clear_texture(
         &self,
         _encoder: &Self::CommandEncoderId,
         _texture: &crate::Texture,
         _subresource_range: &wgt::ImageSubresourceRange,
     ) {
+        //TODO
     }
 
     fn command_encoder_clear_buffer(
@@ -1926,6 +2243,7 @@ impl crate::Context for Context {
         _offset: wgt::BufferAddress,
         _size: Option<wgt::BufferSize>,
     ) {
+        //TODO
     }
 
     fn command_encoder_insert_debug_marker(&self, _encoder: &Self::CommandEncoderId, _label: &str) {
@@ -2006,6 +2324,34 @@ impl crate::Context for Context {
             );
     }
 
+    fn queue_validate_write_buffer(
+        &self,
+        _queue: &Self::QueueId,
+        _buffer: &Self::BufferId,
+        _offset: wgt::BufferAddress,
+        _size: wgt::BufferSize,
+    ) {
+        // TODO
+    }
+
+    fn queue_create_staging_buffer(
+        &self,
+        _queue: &Self::QueueId,
+        size: wgt::BufferSize,
+    ) -> QueueWriteBuffer {
+        QueueWriteBuffer(vec![0; size.get() as usize].into_boxed_slice())
+    }
+
+    fn queue_write_staging_buffer(
+        &self,
+        queue: &Self::QueueId,
+        buffer: &Self::BufferId,
+        offset: wgt::BufferAddress,
+        staging_buffer: &QueueWriteBuffer,
+    ) {
+        self.queue_write_buffer(queue, buffer, offset, staging_buffer)
+    }
+
     fn queue_write_texture(
         &self,
         queue: &Self::QueueId,
@@ -2045,10 +2391,12 @@ impl crate::Context for Context {
         &self,
         queue: &Self::QueueId,
         command_buffers: I,
-    ) {
+    ) -> Self::SubmissionIndex {
         let temp_command_buffers = command_buffers.map(|i| i.0).collect::<js_sys::Array>();
 
         queue.0.submit(&temp_command_buffers);
+
+        SubmissionIndex
     }
 
     fn queue_get_timestamp_period(&self, _queue: &Self::QueueId) -> f32 {
@@ -2058,7 +2406,8 @@ impl crate::Context for Context {
     fn queue_on_submitted_work_done(
         &self,
         _queue: &Self::QueueId,
-    ) -> Self::OnSubmittedWorkDoneFuture {
+        _callback: Box<dyn FnOnce() + Send + 'static>,
+    ) {
         unimplemented!()
     }
 
@@ -2067,6 +2416,23 @@ impl crate::Context for Context {
 }
 
 pub(crate) type SurfaceOutputDetail = ();
+
+#[derive(Debug)]
+pub struct QueueWriteBuffer(Box<[u8]>);
+
+impl std::ops::Deref for QueueWriteBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        panic!("QueueWriteBuffer is write-only!");
+    }
+}
+
+impl std::ops::DerefMut for QueueWriteBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 #[derive(Debug)]
 pub struct BufferMappedRange {

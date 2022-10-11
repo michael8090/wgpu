@@ -5,7 +5,7 @@ use std::env;
 use std::fs::File;
 use std::io::Write;
 use std::mem::size_of;
-use wgpu::{Buffer, Device};
+use wgpu::{Buffer, Device, SubmissionIndex};
 
 async fn run(png_output_path: &str) {
     let args: Vec<_> = env::args().collect();
@@ -20,18 +20,28 @@ async fn run(png_output_path: &str) {
             return;
         }
     };
-    let (device, buffer, buffer_dimensions) = create_red_image_with_dimensions(width, height).await;
-    create_png(png_output_path, device, buffer, &buffer_dimensions).await;
+    let (device, buffer, buffer_dimensions, submission_index) =
+        create_red_image_with_dimensions(width, height).await;
+    create_png(
+        png_output_path,
+        device,
+        buffer,
+        &buffer_dimensions,
+        submission_index,
+    )
+    .await;
 }
 
 async fn create_red_image_with_dimensions(
     width: usize,
     height: usize,
-) -> (Device, Buffer, BufferDimensions) {
-    let adapter = wgpu::Instance::new(wgpu::Backends::PRIMARY)
-        .request_adapter(&wgpu::RequestAdapterOptions::default())
-        .await
-        .unwrap();
+) -> (Device, Buffer, BufferDimensions, SubmissionIndex) {
+    let adapter = wgpu::Instance::new(
+        wgpu::util::backend_bits_from_env().unwrap_or_else(wgpu::Backends::all),
+    )
+    .request_adapter(&wgpu::RequestAdapterOptions::default())
+    .await
+    .unwrap();
 
     let (device, queue) = adapter
         .request_device(
@@ -81,14 +91,14 @@ async fn create_red_image_with_dimensions(
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: None,
-            color_attachments: &[wgpu::RenderPassColorAttachment {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &texture.create_view(&wgpu::TextureViewDescriptor::default()),
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::RED),
                     store: true,
                 },
-            }],
+            })],
             depth_stencil_attachment: None,
         });
 
@@ -112,8 +122,8 @@ async fn create_red_image_with_dimensions(
         encoder.finish()
     };
 
-    queue.submit(Some(command_buffer));
-    (device, output_buffer, buffer_dimensions)
+    let index = queue.submit(Some(command_buffer));
+    (device, output_buffer, buffer_dimensions, index)
 }
 
 async fn create_png(
@@ -121,22 +131,27 @@ async fn create_png(
     device: Device,
     output_buffer: Buffer,
     buffer_dimensions: &BufferDimensions,
+    submission_index: SubmissionIndex,
 ) {
     // Note that we're not calling `.await` here.
     let buffer_slice = output_buffer.slice(..);
-    let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
+    // Sets the buffer up for mapping, sending over the result of the mapping back to us when it is finished.
+    let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
 
     // Poll the device in a blocking manner so that our future resolves.
     // In an actual application, `device.poll(...)` should
     // be called in an event loop or on another thread.
-    device.poll(wgpu::Maintain::Wait);
+    //
+    // We pass our submission index so we don't need to wait for any other possible submissions.
+    device.poll(wgpu::Maintain::WaitForSubmissionIndex(submission_index));
     // If a file system is available, write the buffer as a PNG
     let has_file_system_available = cfg!(not(target_arch = "wasm32"));
     if !has_file_system_available {
         return;
     }
 
-    if let Ok(()) = buffer_future.await {
+    if let Some(Ok(())) = receiver.receive().await {
         let padded_buffer = buffer_slice.get_mapped_range();
 
         let mut png_encoder = png::Encoder::new(
@@ -145,11 +160,12 @@ async fn create_png(
             buffer_dimensions.height as u32,
         );
         png_encoder.set_depth(png::BitDepth::Eight);
-        png_encoder.set_color(png::ColorType::RGBA);
+        png_encoder.set_color(png::ColorType::Rgba);
         let mut png_writer = png_encoder
             .write_header()
             .unwrap()
-            .into_stream_writer_with_size(buffer_dimensions.unpadded_bytes_per_row);
+            .into_stream_writer_with_size(buffer_dimensions.unpadded_bytes_per_row)
+            .unwrap();
 
         // from the padded_buffer we write just the unpadded bytes into the image
         for chunk in padded_buffer.chunks(buffer_dimensions.padded_bytes_per_row) {
@@ -211,18 +227,15 @@ mod tests {
 
     #[test]
     fn ensure_generated_data_matches_expected() {
-        pollster::block_on(assert_generated_data_matches_expected());
+        assert_generated_data_matches_expected();
     }
 
-    async fn assert_generated_data_matches_expected() {
+    fn assert_generated_data_matches_expected() {
         let (device, output_buffer, dimensions) =
             create_red_image_with_dimensions(100usize, 200usize).await;
         let buffer_slice = output_buffer.slice(..);
-        let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
+        buffer_slice.map_async(wgpu::MapMode::Read, |_| ());
         device.poll(wgpu::Maintain::Wait);
-        buffer_future
-            .await
-            .expect("failed to map buffer slice for capture test");
         let padded_buffer = buffer_slice.get_mapped_range();
         let expected_buffer_size = dimensions.padded_bytes_per_row * dimensions.height;
         assert_eq!(padded_buffer.len(), expected_buffer_size);

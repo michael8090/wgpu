@@ -1,4 +1,5 @@
 use bytemuck::{Pod, Zeroable};
+use nanorand::{Rng, WyRand};
 use std::{borrow::Cow, mem};
 use wgpu::util::DeviceExt;
 
@@ -35,6 +36,7 @@ struct Example {
     bunnies: Vec<Locals>,
     local_buffer: wgpu::Buffer,
     extent: [u32; 2],
+    rng: WyRand,
 }
 
 impl framework::Example for Example {
@@ -44,7 +46,7 @@ impl framework::Example for Example {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Self {
-        let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
                 "../../../wgpu-hal/examples/halmark/shader.wgsl"
@@ -77,10 +79,7 @@ impl framework::Example for Example {
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler {
-                            filtering: true,
-                            comparison: false,
-                        },
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
                 ],
@@ -117,26 +116,28 @@ impl framework::Example for Example {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: "fs_main",
-                targets: &[wgpu::ColorTargetState {
+                targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::default(),
-                }],
+                })],
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleStrip,
+                strip_index_format: Some(wgpu::IndexFormat::Uint16),
                 ..wgpu::PrimitiveState::default()
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
+            multiview: None,
         });
 
         let texture = {
             let img_data = include_bytes!("../../../logo.png");
             let decoder = png::Decoder::new(std::io::Cursor::new(img_data));
-            let (info, mut reader) = decoder.read_info().unwrap();
-            let mut buf = vec![0; info.buffer_size()];
-            reader.next_frame(&mut buf).unwrap();
+            let mut reader = decoder.read_info().unwrap();
+            let mut buf = vec![0; reader.output_buffer_size()];
+            let info = reader.next_frame(&mut buf).unwrap();
 
             let size = wgpu::Extent3d {
                 width: info.width,
@@ -177,7 +178,7 @@ impl framework::Example for Example {
         });
 
         let globals = Globals {
-            mvp: cgmath::ortho(
+            mvp: glam::Mat4::orthographic_rh(
                 0.0,
                 config.width as f32,
                 0.0,
@@ -185,7 +186,7 @@ impl framework::Example for Example {
                 -1.0,
                 1.0,
             )
-            .into(),
+            .to_cols_array_2d(),
             size: [BUNNY_SIZE; 2],
             pad: [0.0; 2],
         };
@@ -194,9 +195,11 @@ impl framework::Example for Example {
             contents: bytemuck::bytes_of(&globals),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
         });
+        let uniform_alignment =
+            device.limits().min_uniform_buffer_offset_alignment as wgpu::BufferAddress;
         let local_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("local"),
-            size: (MAX_BUNNIES as wgpu::BufferAddress) * wgpu::BIND_BUFFER_ALIGNMENT,
+            size: (MAX_BUNNIES as wgpu::BufferAddress) * uniform_alignment,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
             mapped_at_creation: false,
         });
@@ -233,6 +236,8 @@ impl framework::Example for Example {
             label: None,
         });
 
+        let rng = WyRand::new_seed(42);
+
         Example {
             pipeline,
             global_group,
@@ -240,6 +245,7 @@ impl framework::Example for Example {
             bunnies: Vec::new(),
             local_buffer,
             extent: [config.width, config.height],
+            rng,
         }
     }
 
@@ -255,14 +261,14 @@ impl framework::Example for Example {
         } = event
         {
             let spawn_count = 64 + self.bunnies.len() / 2;
-            let color = rand::random::<u32>();
+            let color = self.rng.generate::<u32>();
             println!(
                 "Spawning {} bunnies, total at {}",
                 spawn_count,
                 self.bunnies.len() + spawn_count
             );
             for _ in 0..spawn_count {
-                let speed = rand::random::<f32>() * MAX_VELOCITY - (MAX_VELOCITY * 0.5);
+                let speed = self.rng.generate::<f32>() * MAX_VELOCITY - (MAX_VELOCITY * 0.5);
                 self.bunnies.push(Locals {
                     position: [0.0, 0.5 * (self.extent[1] as f32)],
                     velocity: [speed, 0.0],
@@ -305,10 +311,11 @@ impl framework::Example for Example {
             }
         }
 
+        let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment;
         queue.write_buffer(&self.local_buffer, 0, unsafe {
             std::slice::from_raw_parts(
                 self.bunnies.as_ptr() as *const u8,
-                self.bunnies.len() * wgpu::BIND_BUFFER_ALIGNMENT as usize,
+                self.bunnies.len() * uniform_alignment as usize,
             )
         });
 
@@ -322,21 +329,21 @@ impl framework::Example for Example {
             };
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear_color),
                         store: true,
                     },
-                }],
+                })],
                 depth_stencil_attachment: None,
             });
             rpass.set_pipeline(&self.pipeline);
             rpass.set_bind_group(0, &self.global_group, &[]);
             for i in 0..self.bunnies.len() {
-                let offset = (i as wgpu::DynamicOffset)
-                    * (wgpu::BIND_BUFFER_ALIGNMENT as wgpu::DynamicOffset);
+                let offset =
+                    (i as wgpu::DynamicOffset) * (uniform_alignment as wgpu::DynamicOffset);
                 rpass.set_bind_group(1, &self.local_group, &[offset]);
                 rpass.draw(0..4, 0..1);
             }
@@ -358,7 +365,7 @@ fn bunnymark() {
         height: 768,
         optional_features: wgpu::Features::default(),
         base_test_parameters: framework::test_common::TestParameters::default(),
-        tolerance: 1,
-        max_outliers: 50,
+        tolerance: 10,
+        max_outliers: 53, // Bounded by WARP
     });
 }

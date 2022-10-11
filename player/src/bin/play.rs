@@ -11,6 +11,8 @@ use std::{
 
 fn main() {
     #[cfg(feature = "winit")]
+    use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
+    #[cfg(feature = "winit")]
     use winit::{event_loop::EventLoop, window::WindowBuilder};
 
     env_logger::init();
@@ -45,8 +47,11 @@ fn main() {
     let mut command_buffer_id_manager = wgc::hub::IdentityManager::default();
 
     #[cfg(feature = "winit")]
-    let surface =
-        global.instance_create_surface(&window, wgc::id::TypedId::zip(0, 1, wgt::Backend::Empty));
+    let surface = global.instance_create_surface(
+        window.raw_display_handle(),
+        window.raw_window_handle(),
+        wgc::id::TypedId::zip(0, 1, wgt::Backend::Empty),
+    );
 
     let device = match actions.pop() {
         Some(trace::Action::Init { desc, backend }) => {
@@ -55,6 +60,7 @@ fn main() {
                 .request_adapter(
                     &wgc::instance::RequestAdapterOptions {
                         power_preference: wgt::PowerPreference::LowPower,
+                        force_fallback_adapter: false,
                         #[cfg(feature = "winit")]
                         compatible_surface: Some(surface),
                         #[cfg(not(feature = "winit"))]
@@ -94,7 +100,7 @@ fn main() {
         }
 
         gfx_select!(device => global.device_stop_capture(device));
-        gfx_select!(device => global.device_poll(device, true)).unwrap();
+        gfx_select!(device => global.device_poll(device, wgt::Maintain::Wait)).unwrap();
     }
     #[cfg(feature = "winit")]
     {
@@ -138,6 +144,11 @@ fn main() {
                             gfx_select!(device => global.surface_present(id)).unwrap();
                             break;
                         }
+                        Some(trace::Action::DiscardSurfaceTexture(id)) => {
+                            log::debug!("Discarding frame {}", frame_count);
+                            gfx_select!(device => global.surface_texture_discard(id)).unwrap();
+                            break;
+                        }
                         Some(action) => {
                             gfx_select!(device => global.process(device, action, &dir, &mut command_buffer_id_manager));
                         }
@@ -175,7 +186,7 @@ fn main() {
                 },
                 Event::LoopDestroyed => {
                     log::info!("Closing");
-                    gfx_select!(device => global.device_poll(device, true)).unwrap();
+                    gfx_select!(device => global.device_poll(device, wgt::Maintain::Wait)).unwrap();
                 }
                 _ => {}
             }

@@ -3,9 +3,11 @@
 mod belt;
 mod device;
 mod encoder;
+mod indirect;
 mod init;
 
-use std::future::Future;
+use std::ops::{Add, Rem, Sub};
+use std::sync::Arc;
 use std::{
     borrow::Cow,
     mem::{align_of, size_of},
@@ -15,10 +17,8 @@ use std::{
 pub use belt::StagingBelt;
 pub use device::{BufferInitDescriptor, DeviceExt};
 pub use encoder::RenderEncoder;
-pub use init::{
-    backend_bits_from_env, initialize_adapter_from_env, initialize_adapter_from_env_or_default,
-    power_preference_from_env,
-};
+pub use indirect::*;
+pub use init::*;
 
 /// Treat the given byte slice as a SPIR-V module.
 ///
@@ -71,7 +71,7 @@ pub fn make_spirv_raw(data: &[u8]) -> Cow<[u32]> {
 }
 
 /// CPU accessible buffer used to download data back from the GPU.
-pub struct DownloadBuffer(super::Buffer, super::BufferMappedRange);
+pub struct DownloadBuffer(Arc<super::Buffer>, super::BufferMappedRange);
 
 impl DownloadBuffer {
     /// Asynchronously read the contents of a buffer.
@@ -79,18 +79,19 @@ impl DownloadBuffer {
         device: &super::Device,
         queue: &super::Queue,
         buffer: &super::BufferSlice,
-    ) -> impl Future<Output = Result<Self, super::BufferAsyncError>> + Send {
+        callback: impl FnOnce(Result<Self, super::BufferAsyncError>) + Send + 'static,
+    ) {
         let size = match buffer.size {
             Some(size) => size.into(),
             None => buffer.buffer.map_context.lock().total_size - buffer.offset,
         };
 
-        let download = device.create_buffer(&super::BufferDescriptor {
+        let download = Arc::new(device.create_buffer(&super::BufferDescriptor {
             size,
             usage: super::BufferUsages::COPY_DST | super::BufferUsages::MAP_READ,
             mapped_at_creation: false,
             label: None,
-        });
+        }));
 
         let mut encoder =
             device.create_command_encoder(&super::CommandEncoderDescriptor { label: None });
@@ -98,13 +99,22 @@ impl DownloadBuffer {
         let command_buffer: super::CommandBuffer = encoder.finish();
         queue.submit(Some(command_buffer));
 
-        let fut = download.slice(..).map_async(super::MapMode::Read);
-        async move {
-            fut.await?;
-            let mapped_range =
-                super::Context::buffer_get_mapped_range(&*download.context, &download.id, 0..size);
-            Ok(Self(download, mapped_range))
-        }
+        download
+            .clone()
+            .slice(..)
+            .map_async(super::MapMode::Read, move |result| {
+                if let Err(e) = result {
+                    callback(Err(e));
+                    return;
+                }
+
+                let mapped_range = super::Context::buffer_get_mapped_range(
+                    &*download.context,
+                    &download.id,
+                    0..size,
+                );
+                callback(Ok(Self(download, mapped_range)));
+            });
     }
 }
 
@@ -112,5 +122,33 @@ impl std::ops::Deref for DownloadBuffer {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         super::BufferMappedRangeSlice::slice(&self.1)
+    }
+}
+
+///
+/// Aligns a `value` to an `alignment`.
+///
+/// Returns the first number greater than or equal to `value` that is also a
+/// multiple of `alignment`. If `value` is already a multiple of `alignment`,
+/// `value` will be returned.
+///
+/// # Examples
+///
+/// ```
+/// # use wgpu::util::align_to;
+/// assert_eq!(align_to(253, 16), 256);
+/// assert_eq!(align_to(256, 16), 256);
+/// assert_eq!(align_to(0, 16), 0);
+/// ```
+///
+pub fn align_to<T>(value: T, alignment: T) -> T
+where
+    T: Add<Output = T> + Copy + Default + PartialEq<T> + Rem<Output = T> + Sub<Output = T>,
+{
+    let remainder = value % alignment;
+    if remainder == T::default() {
+        value
+    } else {
+        value + alignment - remainder
     }
 }

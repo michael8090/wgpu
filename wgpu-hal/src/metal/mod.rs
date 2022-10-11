@@ -20,7 +20,7 @@ mod device;
 mod surface;
 
 use std::{
-    iter, ops,
+    fmt, iter, ops,
     ptr::NonNull,
     sync::{atomic, Arc},
     thread,
@@ -61,7 +61,9 @@ impl crate::Api for Api {
     type ComputePipeline = ComputePipeline;
 }
 
-pub struct Instance {}
+pub struct Instance {
+    managed_metal_layer_delegate: surface::HalManagedMetalLayerDelegate,
+}
 
 impl Instance {
     pub fn create_surface_from_layer(&self, layer: &mtl::MetalLayerRef) -> Surface {
@@ -72,22 +74,27 @@ impl Instance {
 impl crate::Instance<Api> for Instance {
     unsafe fn init(_desc: &crate::InstanceDescriptor) -> Result<Self, crate::InstanceError> {
         //TODO: enable `METAL_DEVICE_WRAPPER_TYPE` environment based on the flags?
-        Ok(Instance {})
+        Ok(Instance {
+            managed_metal_layer_delegate: surface::HalManagedMetalLayerDelegate::new(),
+        })
     }
 
     unsafe fn create_surface(
         &self,
-        has_handle: &impl raw_window_handle::HasRawWindowHandle,
+        _display_handle: raw_window_handle::RawDisplayHandle,
+        window_handle: raw_window_handle::RawWindowHandle,
     ) -> Result<Surface, crate::InstanceError> {
-        match has_handle.raw_window_handle() {
+        match window_handle {
             #[cfg(target_os = "ios")]
-            raw_window_handle::RawWindowHandle::IOS(handle) => {
-                Ok(Surface::from_uiview(handle.ui_view))
+            raw_window_handle::RawWindowHandle::UiKit(handle) => {
+                let _ = &self.managed_metal_layer_delegate;
+                Ok(Surface::from_view(handle.ui_view, None))
             }
             #[cfg(target_os = "macos")]
-            raw_window_handle::RawWindowHandle::MacOS(handle) => {
-                Ok(Surface::from_nsview(handle.ns_view))
-            }
+            raw_window_handle::RawWindowHandle::AppKit(handle) => Ok(Surface::from_view(
+                handle.ns_view,
+                Some(&self.managed_metal_layer_delegate),
+            )),
             _ => Err(crate::InstanceError),
         }
     }
@@ -108,11 +115,9 @@ impl crate::Instance<Api> for Instance {
                         name,
                         vendor: 0,
                         device: 0,
-                        device_type: if shared.private_caps.low_power {
-                            wgt::DeviceType::IntegratedGpu
-                        } else {
-                            wgt::DeviceType::DiscreteGpu
-                        },
+                        device_type: shared.private_caps.device_type(),
+                        driver: String::new(),
+                        driver_info: String::new(),
                         backend: wgt::Backend::Metal,
                     },
                     features: shared.private_caps.features(),
@@ -131,12 +136,16 @@ impl crate::Instance<Api> for Instance {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct PrivateCapabilities {
     family_check: bool,
     msl_version: mtl::MTLLanguageVersion,
-    exposed_queues: usize,
+    fragment_rw_storage: bool,
     read_write_texture_tier: mtl::MTLReadWriteTextureTier,
+    msaa_desktop: bool,
+    msaa_apple3: bool,
+    msaa_apple7: bool,
     resource_heaps: bool,
     argument_buffers: bool,
     shared_textures: bool,
@@ -160,6 +169,7 @@ struct PrivateCapabilities {
     format_bc: bool,
     format_eac_etc: bool,
     format_astc: bool,
+    format_astc_hdr: bool,
     format_any8_unorm_srgb_all: bool,
     format_any8_unorm_srgb_no_write: bool,
     format_any8_snorm_all: bool,
@@ -196,6 +206,7 @@ struct PrivateCapabilities {
     format_bgr10a2_all: bool,
     format_bgr10a2_no_write: bool,
     max_buffers_per_stage: ResourceIndex,
+    max_vertex_buffers: ResourceIndex,
     max_textures_per_stage: ResourceIndex,
     max_samplers_per_stage: ResourceIndex,
     buffer_alignment: u64,
@@ -205,6 +216,8 @@ struct PrivateCapabilities {
     max_texture_layers: u64,
     max_fragment_input_components: u64,
     max_color_render_targets: u8,
+    max_varying_components: u32,
+    max_threads_per_group: u32,
     max_total_threadgroup_memory: u32,
     sample_count_mask: u8,
     supports_debug_markers: bool,
@@ -216,6 +229,9 @@ struct PrivateCapabilities {
     supports_arrays_of_textures: bool,
     supports_arrays_of_textures_write: bool,
     supports_mutability: bool,
+    supports_depth_clip_control: bool,
+    supports_preserve_invariance: bool,
+    has_unified_memory: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +239,7 @@ struct PrivateDisabilities {
     /// Near depth is not respected properly on some Intel GPUs.
     broken_viewport_near_depth: bool,
     /// Multi-target clears don't appear to work properly on Intel GPUs.
+    #[allow(dead_code)]
     broken_layered_clear_image: bool,
 }
 
@@ -248,7 +265,7 @@ impl AdapterShared {
 
         Self {
             disabilities: PrivateDisabilities::new(&device),
-            private_caps: PrivateCapabilities::new(&device),
+            private_caps,
             device: Mutex::new(device),
             settings: Settings::default(),
         }
@@ -275,6 +292,7 @@ pub struct Surface {
     view: Option<NonNull<objc::runtime::Object>>,
     render_layer: Mutex<mtl::MetalLayer>,
     raw_swapchain_format: mtl::MTLPixelFormat,
+    extent: wgt::Extent3d,
     main_thread_id: thread::ThreadId,
     // Useful for UI-intensive applications that are sensitive to
     // window resizing.
@@ -324,7 +342,7 @@ impl crate::Queue<Api> for Queue {
                                 .to_owned()
                         }
                     };
-                    raw.set_label("_Signal");
+                    raw.set_label("(wgpu internal) Signal");
                     raw.add_completed_handler(&block);
 
                     fence.maintain();
@@ -356,7 +374,7 @@ impl crate::Queue<Api> for Queue {
         let queue = &self.raw.lock();
         objc::rc::autoreleasepool(|| {
             let command_buffer = queue.new_command_buffer();
-            command_buffer.set_label("_Present");
+            command_buffer.set_label("(wgpu internal) Present");
 
             // https://developer.apple.com/documentation/quartzcore/cametallayer/1478157-presentswithtransaction?language=objc
             if !texture.present_with_transaction {
@@ -372,13 +390,17 @@ impl crate::Queue<Api> for Queue {
         });
         Ok(())
     }
+
+    unsafe fn get_timestamp_period(&self) -> f32 {
+        // TODO: This is hard, see https://github.com/gpuweb/gpuweb/issues/1325
+        1.0
+    }
 }
 
 #[derive(Debug)]
 pub struct Buffer {
     raw: mtl::Buffer,
     size: wgt::BufferAddress,
-    options: mtl::MTLResourceOptions,
 }
 
 unsafe impl Send for Buffer {}
@@ -397,6 +419,7 @@ pub struct Texture {
     raw_type: mtl::MTLTextureType,
     array_layers: u32,
     mip_levels: u32,
+    copy_size: crate::CopyExtent,
 }
 
 unsafe impl Send for Texture {}
@@ -507,6 +530,7 @@ pub struct PipelineLayout {
     bind_group_infos: ArrayVec<BindGroupLayoutInfo, { crate::MAX_BIND_GROUPS }>,
     push_constants_infos: MultiStageData<Option<PushConstantsInfo>>,
     total_counters: MultiStageResourceCounters,
+    total_push_constants: u32,
 }
 
 trait AsNative {
@@ -611,6 +635,7 @@ pub struct RenderPipeline {
     vs_info: PipelineStageInfo,
     fs_info: PipelineStageInfo,
     raw_primitive_type: mtl::MTLPrimitiveType,
+    raw_triangle_fill_mode: mtl::MTLTriangleFillMode,
     raw_front_winding: mtl::MTLWinding,
     raw_cull_mode: mtl::MTLCullMode,
     raw_depth_clip_mode: Option<mtl::MTLDepthClipMode>,
@@ -678,7 +703,7 @@ struct IndexState {
 
 #[derive(Default)]
 struct Temp {
-    binding_sizes: Vec<wgt::BufferSize>,
+    binding_sizes: Vec<u32>,
 }
 
 struct CommandState {
@@ -691,6 +716,7 @@ struct CommandState {
     stage_infos: MultiStageData<PipelineStageInfo>,
     storage_buffer_length_map: fxhash::FxHashMap<naga::ResourceBinding, wgt::BufferSize>,
     work_group_memory_sizes: Vec<u32>,
+    push_constants: Vec<u32>,
 }
 
 pub struct CommandEncoder {
@@ -701,9 +727,19 @@ pub struct CommandEncoder {
     temp: Temp,
 }
 
+impl fmt::Debug for CommandEncoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CommandEncoder")
+            .field("raw_queue", &self.raw_queue)
+            .field("raw_cmd_buf", &self.raw_cmd_buf)
+            .finish()
+    }
+}
+
 unsafe impl Send for CommandEncoder {}
 unsafe impl Sync for CommandEncoder {}
 
+#[derive(Debug)]
 pub struct CommandBuffer {
     raw: mtl::CommandBuffer,
 }

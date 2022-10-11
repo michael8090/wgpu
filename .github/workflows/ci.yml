@@ -6,6 +6,16 @@ on:
     tags: [v0.*]
   pull_request:
 
+env:
+  RUST_BACKTRACE: 1
+  RUST_VERSION: 1.62
+
+# We distinguish the following kinds of builds:
+# - local: build for the same target as we compile on, and do local tests
+# - other: build without testing, e.g. cross-build
+# - web: build for the Web
+# - em: build for the Emscripten
+
 jobs:
   build:
     strategy:
@@ -15,143 +25,212 @@ jobs:
           # Windows
           - name: Windows x86_64
             os: windows-2019
-            channel: stable
             target: x86_64-pc-windows-msvc
-            kind: test
+            tool: clippy
+            kind: local
+            backends: dx12 # dx11
+            nextest_url: https://get.nexte.st/latest/windows-tar
+
+          - name: Windows Nightly x86_64
+            os: windows-2019
+            target: x86_64-pc-windows-msvc
+            tool: check
+            kind: other
           
           # MacOS
-
-          # Mac has no software runners, so don't run tests
           - name: MacOS x86_64
-            os: macos-10.15
-            channel: stable
+            os: macos-11
             target: x86_64-apple-darwin
-            kind: compile
+            tool: clippy
+            # Mac has no software runners, so don't run tests
+            kind: other
 
+          - name: MacOS aarch64
+            os: macos-11
+            target: aarch64-apple-darwin
+            tool: check
+            # Mac has no software runners, so don't run tests
+            kind: other
           
           # IOS
           - name: IOS aarch64
-            os: macos-10.15
-            channel: stable
+            os: macos-11
             target: aarch64-apple-ios
-            kind: compile
+            tool: clippy
+            kind: other
 
 
           # Linux
           - name: Linux x86_64
             os: ubuntu-20.04
-            channel: stable
             target: x86_64-unknown-linux-gnu
-            kind: test
+            tool: clippy
+            kind: local
+            backends: vulkan gl
+            nextest_url: https://get.nexte.st/latest/linux
+
+          - name: Linux aarch64
+            os: ubuntu-20.04
+            target: aarch64-unknown-linux-gnu
+            tool: check
+            kind: other
 
           - name: Linux Nightly x86_64
             os: ubuntu-20.04
-            channel: nightly
             target: x86_64-unknown-linux-gnu
-            kind: compile
+            tool: check
+            kind: other
 
           
           # Android
           - name: Android aarch64
             os: ubuntu-20.04
-            channel: stable
             target: aarch64-linux-android
-            kind: compile
+            tool: clippy
+            kind: other
 
           
           # WebGPU/WebGL
           - name: WebAssembly
             os: ubuntu-20.04
-            channel: stable
             target: wasm32-unknown-unknown
-            kind: webgl
+            tool: clippy
+            kind: web
 
-    name: ${{ matrix.name }}
+          - name: Emscripten
+            os: ubuntu-20.04
+            target: wasm32-unknown-emscripten
+            tool: clippy
+            kind: em
+
+    name: Check ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
 
     env:
       PKG_CONFIG_ALLOW_CROSS: 1 # allow android to work
-      RUSTFLAGS: --cfg=web_sys_unstable_apis
+      RUSTFLAGS: --cfg=web_sys_unstable_apis -D warnings
       RUSTDOCFLAGS: -Dwarnings
 
     steps:
       - name: checkout repo
         uses: actions/checkout@v2
 
-      - name: install rust
+      # Only run clippy on MSRV
+      - name: install rust stable
+        if: matrix.tool == 'clippy'
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: ${{ matrix.channel }}
+          toolchain: ${{ env.RUST_VERSION }}
           target: ${{ matrix.target }}
-          override: true
           profile: minimal
+          override: true
           components: clippy
+
+      # Other builds can use nightly
+      - name: install rust nightly
+        if: matrix.tool != 'clippy'
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          target: ${{ matrix.target }}
+          profile: minimal
+          override: true
+
+      - name: caching
+        uses: Swatinem/rust-cache@v1
+        with:
+          key: ${{ matrix.target }}-b # suffix for cache busting
+
+      - name: download nextest
+        if: matrix.kind == 'local'
+        shell: bash
+        run: |
+          curl -LsSf ${{ matrix.nextest_url }} | tar xzf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: add android apk to path
         if: matrix.os == 'ubuntu-20.04' && matrix.target == 'aarch64-linux-android'
         run: |
           echo "$ANDROID_HOME/ndk-bundle/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-      - name: install llvmpipe and lavapipe
-        if: matrix.os == 'ubuntu-20.04' && matrix.kind == 'test'
+      - name: install llvmpipe, lavapipe, and vulkan sdk
+        if: matrix.os == 'ubuntu-20.04' && matrix.target != 'aarch64-linux-android' && matrix.kind == 'local'
         run: |
-          echo "Installing Vulkan"
           sudo apt-get update -y -qq
-          sudo add-apt-repository ppa:ubuntu-x-swat/updates -y
-          sudo apt-get update
-          sudo apt install -y libxcb-xfixes0-dev mesa-vulkan-drivers
+          
+          # llvmpipe/lavapipe
+          sudo add-apt-repository ppa:oibaf/graphics-drivers -y
 
-      # This is separate for now because webgl isn't hooked up so we can't compile wgpu-core for wasm
-      - name: check web
-        if: matrix.kind == 'webgl'
+          # vulkan sdk
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-focal.list https://packages.lunarg.com/vulkan/lunarg-vulkan-focal.list
+
+          sudo apt-get update
+          sudo apt install -y libegl1-mesa libgl1-mesa-dri libxcb-xfixes0-dev mesa-vulkan-drivers vulkan-sdk
+
+      # We enable line numbers for panics, but that's it
+      - name: disable debug
+        shell: bash
         run: |
-          cargo clippy --target ${{ matrix.target }} -p wgpu -- -D warnings
+          mkdir -p .cargo
+          echo """\n[profile.dev]
+          debug = 1" >> .cargo/config.toml
+
+      - name: check web
+        if: matrix.kind == 'web'
+        run: |
+          # build with no features
+          cargo ${{matrix.tool}} --target ${{ matrix.target }} -p wgpu --no-default-features
+
+          # build examples
+          cargo ${{matrix.tool}} --target ${{ matrix.target }} -p wgpu --examples
+
+          # build with features
+          cargo ${{matrix.tool}} --target ${{ matrix.target }} -p wgpu --features glsl,spirv
+
+          # build for WebGL
+          cargo ${{matrix.tool}} --target ${{ matrix.target }} -p wgpu --features webgl
 
           # build docs
           cargo doc --target ${{ matrix.target }} -p wgpu --no-deps
 
-      - name: check native stable (fatal warnings)
-        if: (matrix.kind == 'compile' || matrix.kind == 'test') && matrix.channel == 'stable'
+      - name: check em
+        if: matrix.kind == 'em'
+        run: |
+          # build for Emscripten/WebGL
+          cargo ${{matrix.tool}} --target ${{ matrix.target }} -p wgpu -p wgpu-hal --no-default-features --features webgl,emscripten
+
+          # build raw-gles example
+          cargo ${{matrix.tool}} --target ${{ matrix.target }} --example raw-gles --features webgl,emscripten
+
+      - name: check native
+        if: matrix.kind == 'local' || matrix.kind == 'other'
         run: |
           # check with no features
-          cargo clippy --target ${{ matrix.target }} -p wgpu -p wgpu-core -p wgpu-info -p player -- -D warnings
+          cargo ${{matrix.tool}} --target ${{ matrix.target }} -p wgpu -p wgpu-core -p wgpu-info -p player --no-default-features
 
           # check with all features
           # explicitly don't mention wgpu-hal so that --all-features don't apply to it
-          cargo clippy --target ${{ matrix.target }} -p wgpu -p wgpu-core -p wgpu-info -p player --examples --tests --all-features -- -D warnings 
+          cargo ${{matrix.tool}} --target ${{ matrix.target }} -p wgpu -p wgpu-core -p wgpu-info -p player --examples --tests --all-features
 
           # build docs
           cargo doc --target ${{ matrix.target }} --no-deps
           cargo doc --target ${{ matrix.target }} -p wgpu -p wgpu-core -p wgpu-info -p player --all-features --no-deps
 
-      - name: check native nightly (non-fatal warnings)
-        if: (matrix.kind == 'compile' || matrix.kind == 'test') && matrix.channel != 'stable'
-        run: |
-          # check with no features
-          cargo clippy --target ${{ matrix.target }} -p wgpu -p wgpu-core -p wgpu-info -p player
-
-          # check with all features
-          # explicitly don't mention wgpu-hal so that --all-features don't apply to it
-          cargo clippy --target ${{ matrix.target }} -p wgpu -p wgpu-core -p wgpu-info -p player --examples --tests --all-features
-
-      - name: build tests
-        if: matrix.kind == 'test'
-        run: |
-          cargo build --target ${{ matrix.target }} --bin wgpu-info 
-          cargo build --target ${{ matrix.target }} --tests --workspace --exclude wgpu
-          cargo build --target ${{ matrix.target }} --examples --tests -p wgpu
-
-      - name: tests
-        if: matrix.kind == 'test' && matrix.os == 'windows-2019'
+      - name: local tests
+        if: matrix.kind == 'local'
+        shell: bash
         run: |
           # run wgpu-info
-          cargo run --target ${{ matrix.target }} --bin wgpu-info
-        
-          # run player tests
-          cargo test --target ${{ matrix.target }} --workspace --exclude wgpu --no-fail-fast -- --nocapture
-
-          # run coretests
-          cargo run --target ${{ matrix.target }} --bin wgpu-info -- cargo test --target ${{ matrix.target }} -p wgpu --no-fail-fast -- --nocapture --test-threads=1 # GLES is currently non-multithreadable
+          cargo run --bin wgpu-info --features angle,vulkan-portability
+          # run unit and player tests
+          cargo nextest run -p wgpu-types -p wgpu-hal -p wgpu-core -p player --no-fail-fast
+          # run native tests
+          for backend in ${{ matrix.backends }}; do
+            echo "======= NATIVE TESTS $backend ======";
+            WGPU_BACKEND=$backend cargo nextest run -p wgpu --no-fail-fast
+            # Test that we catch overflows in `--release` builds too.
+            WGPU_BACKEND=$backend cargo nextest run --release -p wgpu --no-fail-fast
+          done
 
   fmt:
     name: Format
@@ -171,3 +250,20 @@ jobs:
       - name: run rustfmt
         run: |
           cargo fmt -- --check
+
+  deno:
+    name: Deno
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v2
+
+      - name: install rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+
+      - name: build Deno
+        run: |
+          cargo check --manifest-path cts_runner/Cargo.toml

@@ -8,7 +8,6 @@ use crate::{
     id::{self, Id, TypedId},
     init_tracker::MemoryInitKind,
     resource::QuerySet,
-    track::UseExtendError,
     Epoch, FastHashMap, Index,
 };
 use std::{iter, marker::PhantomData};
@@ -111,6 +110,18 @@ pub enum QueryError {
     InvalidBuffer(id::BufferId),
     #[error("QuerySet {0:?} is invalid or destroyed")]
     InvalidQuerySet(id::QuerySetId),
+}
+
+impl crate::error::PrettyError for QueryError {
+    fn fmt_pretty(&self, fmt: &mut crate::error::ErrorFormatter) {
+        fmt.error(self);
+        match *self {
+            Self::InvalidBuffer(id) => fmt.buffer_label(&id),
+            Self::InvalidQuerySet(id) => fmt.query_set_label(&id),
+
+            _ => {}
+        }
+    }
 }
 
 /// Error encountered while trying to use queries
@@ -300,11 +311,8 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         let query_set = cmd_buf
             .trackers
             .query_sets
-            .use_extend(&*query_set_guard, query_set_id, (), ())
-            .map_err(|e| match e {
-                UseExtendError::InvalidResource => QueryError::InvalidQuerySet(query_set_id),
-                _ => unreachable!(),
-            })?;
+            .add_single(&*query_set_guard, query_set_id)
+            .ok_or(QueryError::InvalidQuerySet(query_set_id))?;
 
         query_set.validate_and_write_timestamp(raw_encoder, query_set_id, query_index, None)?;
 
@@ -348,17 +356,14 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         let query_set = cmd_buf
             .trackers
             .query_sets
-            .use_extend(&*query_set_guard, query_set_id, (), ())
-            .map_err(|e| match e {
-                UseExtendError::InvalidResource => QueryError::InvalidQuerySet(query_set_id),
-                _ => unreachable!(),
-            })?;
+            .add_single(&*query_set_guard, query_set_id)
+            .ok_or(QueryError::InvalidQuerySet(query_set_id))?;
 
         let (dst_buffer, dst_pending) = cmd_buf
             .trackers
             .buffers
-            .use_replace(&*buffer_guard, destination, (), hal::BufferUses::COPY_DST)
-            .map_err(QueryError::InvalidBuffer)?;
+            .set_single(&*buffer_guard, destination, hal::BufferUses::COPY_DST)
+            .ok_or(QueryError::InvalidBuffer(destination))?;
         let dst_barrier = dst_pending.map(|pending| pending.into_hal(dst_buffer));
 
         if !dst_buffer.usage.contains(wgt::BufferUsages::COPY_DST) {
@@ -407,7 +412,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
             ));
 
         unsafe {
-            raw_encoder.transition_buffers(dst_barrier);
+            raw_encoder.transition_buffers(dst_barrier.into_iter());
             raw_encoder.copy_query_results(
                 &query_set.raw,
                 start_query..end_query,

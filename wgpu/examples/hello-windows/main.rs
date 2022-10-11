@@ -1,3 +1,5 @@
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+
 use std::collections::HashMap;
 use winit::{
     event::{Event, WindowEvent},
@@ -31,10 +33,11 @@ impl ViewportDesc {
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: self.surface.get_preferred_format(adapter).unwrap(),
+            format: self.surface.get_supported_formats(adapter)[0],
             width: size.width,
             height: size.height,
             present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: self.surface.get_supported_alpha_modes(adapter)[0],
         };
 
         self.surface.configure(device, &config);
@@ -49,26 +52,25 @@ impl Viewport {
         self.config.height = size.height;
         self.desc.surface.configure(device, &self.config);
     }
-    fn get_current_frame(&mut self) -> wgpu::SurfaceTexture {
+    fn get_current_texture(&mut self) -> wgpu::SurfaceTexture {
         self.desc
             .surface
-            .get_current_frame()
+            .get_current_texture()
             .expect("Failed to acquire next swap chain texture")
-            .output
     }
 }
 
 async fn run(event_loop: EventLoop<()>, viewports: Vec<(Window, wgpu::Color)>) {
-    let instance = wgpu::Instance::new(wgpu::Backends::PRIMARY);
+    let instance = wgpu::Instance::new(wgpu::Backends::all());
     let viewports: Vec<_> = viewports
         .into_iter()
         .map(|(window, color)| ViewportDesc::new(window, color, &instance))
         .collect();
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
             // Request an adapter which can render to our surface
             compatible_surface: viewports.first().map(|desc| &desc.surface),
+            ..Default::default()
         })
         .await
         .expect("Failed to find an appropriate adapter");
@@ -107,11 +109,13 @@ async fn run(event_loop: EventLoop<()>, viewports: Vec<(Window, wgpu::Color)>) {
                 // Recreate the swap chain with the new size
                 if let Some(viewport) = viewports.get_mut(&window_id) {
                     viewport.resize(&device, size);
+                    // On macos the window needs to be redrawn manually after resizing
+                    viewport.desc.window.request_redraw();
                 }
             }
             Event::RedrawRequested(window_id) => {
                 if let Some(viewport) = viewports.get_mut(&window_id) {
-                    let frame = viewport.get_current_frame();
+                    let frame = viewport.get_current_texture();
                     let view = frame
                         .texture
                         .create_view(&wgpu::TextureViewDescriptor::default());
@@ -120,19 +124,20 @@ async fn run(event_loop: EventLoop<()>, viewports: Vec<(Window, wgpu::Color)>) {
                     {
                         let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: None,
-                            color_attachments: &[wgpu::RenderPassColorAttachment {
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                 view: &view,
                                 resolve_target: None,
                                 ops: wgpu::Operations {
                                     load: wgpu::LoadOp::Clear(viewport.desc.background),
                                     store: true,
                                 },
-                            }],
+                            })],
                             depth_stencil_attachment: None,
                         });
                     }
 
                     queue.submit(Some(encoder.finish()));
+                    frame.present();
                 }
             }
             Event::WindowEvent {

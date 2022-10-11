@@ -1,8 +1,8 @@
 [package]
 name = "wgpu-info"
-version = "0.10.0"
+version = "0.14.0"
 authors = ["wgpu developers"]
-edition = "2018"
+edition = "2021"
 description = "Adapter information and per-adapter test program"
 homepage = "https://github.com/gfx-rs/wgpu"
 repository = "https://github.com/gfx-rs/wgpu"
@@ -10,5 +10,5 @@ keywords = ["graphics"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-env_logger = "0.8"
-wgpu = { version = "0.10", path = "../wgpu" }
+env_logger = "0.9"
+wgpu = { version = "0.14", path = "../wgpu" }

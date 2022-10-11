@@ -2,9 +2,8 @@
 mod framework;
 
 use bytemuck::{Pod, Zeroable};
-use cgmath::SquareMatrix;
-use std::borrow::Cow;
-use wgpu::util::DeviceExt;
+use std::{borrow::Cow, f32::consts};
+use wgpu::{util::DeviceExt, AstcBlock, AstcChannel};
 
 const IMAGE_SIZE: u32 = 128;
 
@@ -33,20 +32,18 @@ const MODEL_CENTER_Y: f32 = 2.0;
 impl Camera {
     fn to_uniform_data(&self) -> [f32; 16 * 3 + 4] {
         let aspect = self.screen_size.0 as f32 / self.screen_size.1 as f32;
-        let mx_projection = cgmath::perspective(cgmath::Deg(45f32), aspect, 1.0, 50.0);
-        let cam_pos = cgmath::Point3::new(
+        let proj = glam::Mat4::perspective_rh(consts::FRAC_PI_4, aspect, 1.0, 50.0);
+        let cam_pos = glam::Vec3::new(
             self.angle_xz.cos() * self.angle_y.sin() * self.dist,
             self.angle_xz.sin() * self.dist + MODEL_CENTER_Y,
             self.angle_xz.cos() * self.angle_y.cos() * self.dist,
         );
-        let mx_view = cgmath::Matrix4::look_at_rh(
+        let view = glam::Mat4::look_at_rh(
             cam_pos,
-            cgmath::Point3::new(0f32, MODEL_CENTER_Y, 0.0),
-            cgmath::Vector3::unit_y(),
+            glam::Vec3::new(0f32, MODEL_CENTER_Y, 0.0),
+            glam::Vec3::Y,
         );
-        let proj = framework::OPENGL_TO_WGPU_MATRIX * mx_projection;
-        let proj_inv = proj.invert().unwrap();
-        let view = framework::OPENGL_TO_WGPU_MATRIX * mx_view;
+        let proj_inv = proj.inverse();
 
         let mut raw = [0f32; 16 * 3 + 4];
         raw[..16].copy_from_slice(&AsRef::<[f32; 16]>::as_ref(&proj)[..]);
@@ -166,17 +163,14 @@ impl framework::Example for Skybox {
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler {
-                        comparison: false,
-                        filtering: true,
-                    },
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
         });
 
         // Create the render pipeline
-        let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
         });
@@ -185,7 +179,7 @@ impl framework::Example for Skybox {
             screen_size: (config.width, config.height),
             angle_xz: 0.2,
             angle_y: 0.2,
-            dist: 30.0,
+            dist: 20.0,
         };
         let raw_uniforms = camera.to_uniform_data();
         let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -212,7 +206,7 @@ impl framework::Example for Skybox {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: "fs_sky",
-                targets: &[config.format.into()],
+                targets: &[Some(config.format.into())],
             }),
             primitive: wgpu::PrimitiveState {
                 front_face: wgpu::FrontFace::Cw,
@@ -226,6 +220,7 @@ impl framework::Example for Skybox {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
+            multiview: None,
         });
         let entity_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Entity"),
@@ -242,7 +237,7 @@ impl framework::Example for Skybox {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: "fs_entity",
-                targets: &[config.format.into()],
+                targets: &[Some(config.format.into())],
             }),
             primitive: wgpu::PrimitiveState {
                 front_face: wgpu::FrontFace::Cw,
@@ -256,6 +251,7 @@ impl framework::Example for Skybox {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
+            multiview: None,
         });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -274,10 +270,13 @@ impl framework::Example for Skybox {
         let skybox_format =
             if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC_LDR) {
                 log::info!("Using ASTC_LDR");
-                wgpu::TextureFormat::Astc4x4RgbaUnormSrgb
+                wgpu::TextureFormat::Astc {
+                    block: AstcBlock::B4x4,
+                    channel: AstcChannel::UnormSrgb,
+                }
             } else if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_ETC2) {
                 log::info!("Using ETC2");
-                wgpu::TextureFormat::Etc2RgbUnormSrgb
+                wgpu::TextureFormat::Etc2Rgb8UnormSrgb
             } else if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC) {
                 log::info!("Using BC");
                 wgpu::TextureFormat::Bc1RgbaUnormSrgb
@@ -296,7 +295,7 @@ impl framework::Example for Skybox {
             depth_or_array_layers: 1,
             ..size
         };
-        let max_mips = layer_size.max_mips();
+        let max_mips = layer_size.max_mips(wgpu::TextureDimension::D2);
 
         log::debug!(
             "Copying {:?} skybox images of size {}, {}, 6 with {} mips to gpu",
@@ -307,8 +306,11 @@ impl framework::Example for Skybox {
         );
 
         let bytes = match skybox_format {
-            wgpu::TextureFormat::Astc4x4RgbaUnormSrgb => &include_bytes!("images/astc.dds")[..],
-            wgpu::TextureFormat::Etc2RgbUnormSrgb => &include_bytes!("images/etc2.dds")[..],
+            wgpu::TextureFormat::Astc {
+                block: AstcBlock::B4x4,
+                channel: AstcChannel::UnormSrgb,
+            } => &include_bytes!("images/astc.dds")[..],
+            wgpu::TextureFormat::Etc2Rgb8UnormSrgb => &include_bytes!("images/etc2.dds")[..],
             wgpu::TextureFormat::Bc1RgbaUnormSrgb => &include_bytes!("images/bc1.dds")[..],
             wgpu::TextureFormat::Bgra8UnormSrgb => &include_bytes!("images/bgra.dds")[..],
             _ => unreachable!(),
@@ -396,7 +398,7 @@ impl framework::Example for Skybox {
         view: &wgpu::TextureView,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        spawner: &framework::Spawner,
+        _spawner: &framework::Spawner,
     ) {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -418,7 +420,7 @@ impl framework::Example for Skybox {
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -430,7 +432,7 @@ impl framework::Example for Skybox {
                         }),
                         store: true,
                     },
-                }],
+                })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_view,
                     depth_ops: Some(wgpu::Operations {
@@ -455,8 +457,7 @@ impl framework::Example for Skybox {
 
         queue.submit(std::iter::once(encoder.finish()));
 
-        let belt_future = self.staging_belt.recall();
-        spawner.spawn_local(belt_future);
+        self.staging_belt.recall();
     }
 }
 
@@ -485,9 +486,9 @@ fn skybox_bc1() {
         width: 1024,
         height: 768,
         optional_features: wgpu::Features::TEXTURE_COMPRESSION_BC,
-        base_test_parameters: framework::test_common::TestParameters::default(),
+        base_test_parameters: framework::test_common::TestParameters::default(), // https://bugs.chromium.org/p/angleproject/issues/detail?id=7056
         tolerance: 5,
-        max_outliers: 10,
+        max_outliers: 105, // Bounded by llvmpipe
     });
 }
 
@@ -498,9 +499,9 @@ fn skybox_etc2() {
         width: 1024,
         height: 768,
         optional_features: wgpu::Features::TEXTURE_COMPRESSION_ETC2,
-        base_test_parameters: framework::test_common::TestParameters::default(),
+        base_test_parameters: framework::test_common::TestParameters::default(), // https://bugs.chromium.org/p/angleproject/issues/detail?id=7056
         tolerance: 5,
-        max_outliers: 100, // Bounded by llvmpipe
+        max_outliers: 105, // Bounded by llvmpipe
     });
 }
 
@@ -511,7 +512,7 @@ fn skybox_astc() {
         width: 1024,
         height: 768,
         optional_features: wgpu::Features::TEXTURE_COMPRESSION_ASTC_LDR,
-        base_test_parameters: framework::test_common::TestParameters::default(),
+        base_test_parameters: framework::test_common::TestParameters::default(), // https://bugs.chromium.org/p/angleproject/issues/detail?id=7056
         tolerance: 5,
         max_outliers: 300, // Bounded by rp4 on vk
     });

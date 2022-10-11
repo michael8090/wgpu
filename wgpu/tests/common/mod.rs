@@ -34,33 +34,11 @@ async fn initialize_device(
 pub struct TestingContext {
     pub adapter: Adapter,
     pub adapter_info: wgt::AdapterInfo,
+    pub adapter_downlevel_capabilities: wgt::DownlevelCapabilities,
     pub device: Device,
+    pub device_features: wgt::Features,
+    pub device_limits: wgt::Limits,
     pub queue: Queue,
-}
-
-// A rather arbitrary set of limits which should be lower than all devices wgpu reasonably expects to run on and provides enough resources for most tests to run.
-// Adjust as needed if they are too low/high.
-pub fn lowest_reasonable_limits() -> Limits {
-    Limits {
-        max_texture_dimension_1d: 1024,
-        max_texture_dimension_2d: 1024,
-        max_texture_dimension_3d: 32,
-        max_texture_array_layers: 32,
-        max_bind_groups: 2,
-        max_dynamic_uniform_buffers_per_pipeline_layout: 2,
-        max_dynamic_storage_buffers_per_pipeline_layout: 2,
-        max_sampled_textures_per_shader_stage: 2,
-        max_samplers_per_shader_stage: 2,
-        max_storage_buffers_per_shader_stage: 2,
-        max_storage_textures_per_shader_stage: 2,
-        max_uniform_buffers_per_shader_stage: 2,
-        max_uniform_buffer_binding_size: 256,
-        max_storage_buffer_binding_size: 1 << 16,
-        max_vertex_buffers: 4,
-        max_vertex_attributes: 4,
-        max_vertex_buffer_array_stride: 32,
-        max_push_constant_size: 0,
-    }
 }
 
 fn lowest_downlevel_properties() -> DownlevelCapabilities {
@@ -81,8 +59,8 @@ pub struct FailureCase {
 // This information determines if a test should run.
 pub struct TestParameters {
     pub required_features: Features,
-    pub required_limits: Limits,
     pub required_downlevel_properties: DownlevelCapabilities,
+    pub required_limits: Limits,
     // Backends where test should fail.
     pub failures: Vec<FailureCase>,
 }
@@ -91,8 +69,8 @@ impl Default for TestParameters {
     fn default() -> Self {
         Self {
             required_features: Features::empty(),
-            required_limits: Limits::downlevel_defaults(),
             required_downlevel_properties: lowest_downlevel_properties(),
+            required_limits: Limits::downlevel_webgl2_defaults(),
             failures: Vec::new(),
         }
     }
@@ -109,9 +87,10 @@ bitflags::bitflags! {
 
 // Builder pattern to make it easier
 impl TestParameters {
-    /// Set of common features that most tests require.
-    pub fn test_features(self) -> Self {
+    /// Set of common features that most internal tests require for readback.
+    pub fn test_features_limits(self) -> Self {
         self.features(Features::MAPPABLE_PRIMARY_BUFFERS | Features::VERTEX_WRITABLE_STORAGE)
+            .limits(wgpu::Limits::downlevel_defaults())
     }
 
     /// Set the list of features this test requires.
@@ -120,18 +99,18 @@ impl TestParameters {
         self
     }
 
-    /// Set the list
-    pub fn limits(mut self, limits: Limits) -> Self {
-        self.required_limits = limits;
-        self
-    }
-
     pub fn downlevel_flags(mut self, downlevel_flags: DownlevelFlags) -> Self {
         self.required_downlevel_properties.flags |= downlevel_flags;
         self
     }
 
-    /// Mark the test as always failing, equivilant to specific_failure(None, None, None)
+    /// Set the limits needed for the test.
+    pub fn limits(mut self, limits: Limits) -> Self {
+        self.required_limits = limits;
+        self
+    }
+
+    /// Mark the test as always failing, equivalent to specific_failure(None, None, None)
     pub fn failure(mut self) -> Self {
         self.failures.push(FailureCase {
             backends: None,
@@ -142,7 +121,18 @@ impl TestParameters {
         self
     }
 
-    /// Mark the test as always failing on a specific backend, equivilant to specific_failure(backend, None, None)
+    /// Mark the test as always failing and needing to be skipped, equivalent to specific_failure(None, None, None)
+    pub fn skip(mut self) -> Self {
+        self.failures.push(FailureCase {
+            backends: None,
+            vendor: None,
+            adapter: None,
+            skip: true,
+        });
+        self
+    }
+
+    /// Mark the test as always failing on a specific backend, equivalent to specific_failure(backend, None, None)
     pub fn backend_failure(mut self, backends: wgpu::Backends) -> Self {
         self.failures.push(FailureCase {
             backends: Some(backends),
@@ -176,7 +166,6 @@ impl TestParameters {
         self
     }
 }
-
 pub fn initialize_test(parameters: TestParameters, test_function: impl FnOnce(TestingContext)) {
     // We don't actually care if it fails
     let _ = env_logger::try_init();
@@ -186,6 +175,7 @@ pub fn initialize_test(parameters: TestParameters, test_function: impl FnOnce(Te
     let adapter = pollster::block_on(util::initialize_adapter_from_env_or_default(
         &instance,
         backend_bits,
+        None,
     ))
     .expect("could not find sutable adapter on the system");
 
@@ -193,7 +183,7 @@ pub fn initialize_test(parameters: TestParameters, test_function: impl FnOnce(Te
     let adapter_lowercase_name = adapter_info.name.to_lowercase();
     let adapter_features = adapter.features();
     let adapter_limits = adapter.limits();
-    let adapter_downlevel_properties = adapter.get_downlevel_properties();
+    let adapter_downlevel_capabilities = adapter.get_downlevel_capabilities();
 
     let missing_features = parameters.required_features - adapter_features;
     if !missing_features.is_empty() {
@@ -201,13 +191,13 @@ pub fn initialize_test(parameters: TestParameters, test_function: impl FnOnce(Te
         return;
     }
 
-    if adapter_limits < parameters.required_limits {
+    if !parameters.required_limits.check_limits(&adapter_limits) {
         println!("TEST SKIPPED: LIMIT TOO LOW");
         return;
     }
 
     let missing_downlevel_flags =
-        parameters.required_downlevel_properties.flags - adapter_downlevel_properties.flags;
+        parameters.required_downlevel_properties.flags - adapter_downlevel_capabilities.flags;
     if !missing_downlevel_flags.is_empty() {
         println!(
             "TEST SKIPPED: MISSING DOWNLEVEL FLAGS {:?}",
@@ -216,12 +206,12 @@ pub fn initialize_test(parameters: TestParameters, test_function: impl FnOnce(Te
         return;
     }
 
-    if adapter_downlevel_properties.shader_model
+    if adapter_downlevel_capabilities.shader_model
         < parameters.required_downlevel_properties.shader_model
     {
         println!(
             "TEST SKIPPED: LOW SHADER MODEL {:?}",
-            adapter_downlevel_properties.shader_model
+            adapter_downlevel_capabilities.shader_model
         );
         return;
     }
@@ -229,17 +219,20 @@ pub fn initialize_test(parameters: TestParameters, test_function: impl FnOnce(Te
     let (device, queue) = pollster::block_on(initialize_device(
         &adapter,
         parameters.required_features,
-        parameters.required_limits,
+        parameters.required_limits.clone(),
     ));
 
     let context = TestingContext {
         adapter,
         adapter_info: adapter_info.clone(),
+        adapter_downlevel_capabilities,
         device,
+        device_features: parameters.required_features,
+        device_limits: parameters.required_limits,
         queue,
     };
 
-    let failure_reason = parameters.failures.iter().find_map(|failure| {
+    let expected_failure_reason = parameters.failures.iter().find_map(|failure| {
         let always =
             failure.backends.is_none() && failure.vendor.is_none() && failure.adapter.is_none();
 
@@ -279,25 +272,38 @@ pub fn initialize_test(parameters: TestParameters, test_function: impl FnOnce(Te
         }
     });
 
-    if let Some((reason, true)) = failure_reason {
+    if let Some((reason, true)) = expected_failure_reason {
         println!("EXPECTED TEST FAILURE SKIPPED: {:?}", reason);
         return;
     }
 
     let panicked = catch_unwind(AssertUnwindSafe(|| test_function(context))).is_err();
+    let canary_set = hal::VALIDATION_CANARY.get_and_reset();
 
-    let expect_failure = failure_reason.is_some();
+    let failed = panicked || canary_set;
 
-    if panicked == expect_failure {
+    let failure_cause = match (panicked, canary_set) {
+        (true, true) => "PANIC AND VALIDATION ERROR",
+        (true, false) => "PANIC",
+        (false, true) => "VALIDATION ERROR",
+        (false, false) => "",
+    };
+
+    let expect_failure = expected_failure_reason.is_some();
+
+    if failed == expect_failure {
         // We got the conditions we expected
-        if let Some((reason, _)) = failure_reason {
+        if let Some((expected_reason, _)) = expected_failure_reason {
             // Print out reason for the failure
-            println!("GOT EXPECTED TEST FAILURE: {:?}", reason);
+            println!(
+                "GOT EXPECTED TEST FAILURE DUE TO {}: {:?}",
+                failure_cause, expected_reason
+            );
         }
-    } else if let Some((reason, _)) = failure_reason {
+    } else if let Some((reason, _)) = expected_failure_reason {
         // We expected to fail, but things passed
         panic!("UNEXPECTED TEST PASS: {:?}", reason);
     } else {
-        panic!("UNEXPECTED TEST FAILURE")
+        panic!("UNEXPECTED TEST FAILURE DUE TO {}", failure_cause)
     }
 }

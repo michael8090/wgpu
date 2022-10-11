@@ -5,6 +5,7 @@ use std::ops::Range;
 #[derive(Clone)]
 pub struct Api;
 pub struct Context;
+#[derive(Debug)]
 pub struct Encoder;
 #[derive(Debug)]
 pub struct Resource;
@@ -43,7 +44,8 @@ impl crate::Instance<Api> for Context {
     }
     unsafe fn create_surface(
         &self,
-        rwh: &impl raw_window_handle::HasRawWindowHandle,
+        _display_handle: raw_window_handle::RawDisplayHandle,
+        _window_handle: raw_window_handle::RawWindowHandle,
     ) -> Result<Context, crate::InstanceError> {
         Ok(Context)
     }
@@ -66,7 +68,7 @@ impl crate::Surface<Api> for Context {
 
     unsafe fn acquire_texture(
         &mut self,
-        timeout_ms: u32,
+        timeout: Option<std::time::Duration>,
     ) -> Result<Option<crate::AcquiredSurfaceTexture<Api>>, crate::SurfaceError> {
         Ok(None)
     }
@@ -74,7 +76,11 @@ impl crate::Surface<Api> for Context {
 }
 
 impl crate::Adapter<Api> for Context {
-    unsafe fn open(&self, features: wgt::Features) -> DeviceResult<crate::OpenDevice<Api>> {
+    unsafe fn open(
+        &self,
+        features: wgt::Features,
+        _limits: &wgt::Limits,
+    ) -> DeviceResult<crate::OpenDevice<Api>> {
         Err(crate::DeviceError::Lost)
     }
     unsafe fn texture_format_capabilities(
@@ -102,6 +108,10 @@ impl crate::Queue<Api> for Context {
         texture: Resource,
     ) -> Result<(), crate::SurfaceError> {
         Ok(())
+    }
+
+    unsafe fn get_timestamp_period(&self) -> f32 {
+        1.0
     }
 }
 
@@ -245,7 +255,7 @@ impl crate::CommandEncoder<Api> for Encoder {
     {
     }
 
-    unsafe fn fill_buffer(&mut self, buffer: &Resource, range: crate::MemoryRange, value: u8) {}
+    unsafe fn clear_buffer(&mut self, buffer: &Resource, range: crate::MemoryRange) {}
 
     unsafe fn copy_buffer_to_buffer<T>(&mut self, src: &Resource, dst: &Resource, regions: T) {}
 
